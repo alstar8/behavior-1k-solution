@@ -7,6 +7,7 @@ import abc
 from collections.abc import Sequence
 import dataclasses
 import difflib
+import json
 import logging
 import os
 import pathlib
@@ -19,12 +20,7 @@ import tyro
 
 # Import from OpenPI
 import openpi.models.model as _model
-import openpi.models.pi0_config as pi0_config
-import openpi.policies.aloha_policy as aloha_policy
-import openpi.policies.droid_policy as droid_policy
-import openpi.policies.libero_policy as libero_policy
 import openpi.shared.download as _download
-import openpi.training.droid_rlds_dataset as droid_rlds_dataset
 import openpi.training.optimizer as _optimizer
 import openpi.transforms as _transforms
 
@@ -85,12 +81,20 @@ class DataConfig:
     behavior_dataset_root: str | None = None
 
     # Action space for DROID dataset.
-    action_space: droid_rlds_dataset.DroidActionSpace | None = None
+    action_space: Any | None = None
     # Path to the data filter file for DROID dataset
     filter_dict_path: str | None = None
 
     # Episodes index to use for training 
     episodes_index: List[int] | None = None
+    # Task name slugs to load (e.g. ["turning_on_radio"]). None = all tasks.
+    tasks: List[str] | None = None
+    modalities: List[str] = dataclasses.field(default_factory=lambda: ["rgb"])
+    tolerance_s: float = 1.0 / 30.0
+    # Rewrite Comet RFT 256-d world-frame proprio to 2026 61-d compact.
+    align_legacy_rft_to_2026: bool = False
+    # If set, overwrite sample task_index (radio specialist). None keeps dataset ids.
+    force_task_index: int | None = None
 
 
 class GroupFactory(Protocol):
@@ -174,6 +178,7 @@ class LeRobotB1KDataConfig(DataConfigFactory):
             "task_index": "task_index",  # Always preserve task_index
             "timestamp": "timestamp",    # Preserve timestamp for subtask state computation
             "episode_index": "episode_index",  # Preserve episode_index for episode length lookup
+            "episode_length": "episode_length",
             "index": "index",           # Preserve index
         }
             
@@ -204,7 +209,8 @@ class LeRobotB1KDataConfig(DataConfigFactory):
         # FAST tokenization (if enabled for PI_BEHAVIOR)
         if self.use_fast_tokenization and hasattr(model_config, 'use_fast_auxiliary') and model_config.use_fast_auxiliary:
             asset_id = self.assets.asset_id or self.repo_id
-            tokenizer_path = assets_dirs / asset_id / "fast_tokenizer"
+            asset_root = pathlib.Path(self.assets.assets_dir) if self.assets.assets_dir else assets_dirs
+            tokenizer_path = asset_root / asset_id / "fast_tokenizer"
             
             # Get base config to access norm_stats
             base_config = self.create_base_config(assets_dirs, model_config)
@@ -260,7 +266,9 @@ class TrainConfig:
     freeze_filter: tyro.conf.Suppress[Filter] = dataclasses.field(default_factory=nnx.Nothing)
 
     # Determines the data to be trained on.
-    data: DataConfigFactory = dataclasses.field(default_factory=LeRobotB1KDataConfig)
+    data: DataConfigFactory | Sequence[DataConfigFactory] = dataclasses.field(default_factory=LeRobotB1KDataConfig)
+    # Mixing weights when `data` is a list of factories (2026 demos + Comet RFT).
+    sample_weights: List[float] | None = None
 
     # Base directory for config assets (e.g., norm stats).
     assets_base_dir: str = "./assets"
@@ -329,6 +337,28 @@ class TrainConfig:
             raise ValueError("Cannot resume and overwrite at the same time.")
 
 
+def _behavior_dataset_root(dataset_name: str) -> str:
+    env_root = os.environ.get("OPENPI_BEHAVIOR_DATA_ROOT") or os.environ.get("BEHAVIOR_DATASET_ROOT")
+    if env_root:
+        root = pathlib.Path(os.path.expanduser(os.path.expandvars(env_root)))
+        return str(root if root.name == dataset_name else root / dataset_name)
+    return str(pathlib.Path("/workspace-SR008.nfs2/datasets/staroverov_b1k/behavior") / dataset_name)
+
+
+def _2026_challenge_task_names() -> list[str]:
+    path = pathlib.Path(_behavior_dataset_root("2026-challenge-demos")) / "meta" / "tasks.jsonl"
+    records = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+    records.sort(key=lambda rec: int(rec["task_index"]))
+    return [rec["task_name"] for rec in records]
+
+
+def get_data_factories(config: "TrainConfig") -> list[DataConfigFactory]:
+    data = config.data
+    if isinstance(data, (list, tuple)):
+        return list(data)
+    return [data]
+
+
 # B1K Training Configurations
 _CONFIGS = [
     TrainConfig(
@@ -375,6 +405,164 @@ _CONFIGS = [
         num_workers=80,
         save_interval=500,
         keep_period=2000,
+    ),
+    # 2026 turning_on_radio specialist: all 200 challenge demos + all Comet RFT
+    # radio trajectories (60/40 mix). Task embeddings and System 2 stay frozen
+    # at the 100-task generalist; norm stats / FAST match that pretrain.
+    TrainConfig(
+        name="pi_behavior_2026_radio_demo0_6_comet0_4",
+        exp_name="openpi",
+        project_name="B1K",
+        model=pi_behavior_config.PiBehaviorConfig(
+            action_horizon=30,
+            action_dim=32,
+            use_correlated_noise=True,
+            correlation_beta=0.5,
+            use_fast_auxiliary=True,
+            fast_loss_weight=0.05,
+            fast_encoded_dims="0:6,7:23",
+            fast_vocab_size=1024,
+            max_fast_tokens=200,
+            use_kv_transform=True,
+            use_knowledge_insulation=False,
+            subtask_loss_weight=0.1,
+            freeze_vision_backbone=True,
+            num_tasks=100,
+        ),
+        sample_weights=[0.6, 0.4],
+        data=[
+            LeRobotB1KDataConfig(
+                repo_id="behavior-1k/2026-challenge-demos",
+                assets=AssetsConfig(
+                    assets_dir="./outputs/assets/pi_behavior_2026_all100_demo0_6_comet0_4",
+                    asset_id="behavior-1k/2026-challenge-demos",
+                ),
+                base_config=DataConfig(
+                    prompt_from_task=False,
+                    behavior_dataset_root=_behavior_dataset_root("2026-challenge-demos"),
+                    use_per_timestamp_norm=True,
+                    tasks=["turning_on_radio"],
+                    episodes_index=list(range(200)),
+                    tolerance_s=1.0 / 30.0,
+                    force_task_index=0,
+                ),
+                use_delta_joint_actions=True,
+                use_fast_tokenization=True,
+            ),
+            LeRobotB1KDataConfig(
+                repo_id="delinqu/comet-1.5k",
+                assets=AssetsConfig(
+                    assets_dir="./outputs/assets/pi_behavior_2026_all100_demo0_6_comet0_4",
+                    asset_id="behavior-1k/2026-challenge-demos",
+                ),
+                base_config=DataConfig(
+                    prompt_from_task=False,
+                    behavior_dataset_root=_behavior_dataset_root("comet-1.5k"),
+                    use_per_timestamp_norm=True,
+                    tasks=["turning_on_radio"],
+                    align_legacy_rft_to_2026=True,
+                    tolerance_s=1.0 / 30.0,
+                    force_task_index=0,
+                ),
+                use_delta_joint_actions=True,
+                use_fast_tokenization=True,
+            ),
+        ],
+        freeze_filter=pi_behavior_config.PiBehaviorConfig(num_tasks=100).get_task_and_system2_freeze_filter(),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=500,
+            peak_lr=2.5e-5,
+            decay_steps=30_000,
+            decay_lr=2.5e-6,
+        ),
+        num_flow_samples=15,
+        weight_loader=weight_loaders.PiBehaviorWeightLoader(
+            "/workspace-SR008.nfs2/datasets/staroverov_b1k/behavior/b1k_solution/"
+            "pi_behavior_2026_all100_demo0_6_comet0_4/"
+            "pi_behavior_2026_all100_bs256_w80_20260919_004055/100000/params"
+        ),
+        num_train_steps=2_000_000,
+        assets_base_dir="./outputs/assets",
+        checkpoint_base_dir="/workspace-SR008.nfs2/datasets/staroverov_b1k/behavior/b1k_solution",
+        num_workers=32,
+        batch_size=128,
+        fsdp_devices=8,
+        save_interval=5_000,
+        keep_period=50_000,
+        log_interval=25,
+    ),
+    # 2026 100-task generalist: trains task embeddings + System-2 stages on all
+    # challenge tasks (plus Comet RFT on the 39 overlapping tasks). Radio
+    # specialist finetune should load this checkpoint with embeddings frozen.
+    TrainConfig(
+        name="pi_behavior_2026_all100_demo0_6_comet0_4",
+        exp_name="openpi",
+        project_name="B1K",
+        model=pi_behavior_config.PiBehaviorConfig(
+            action_horizon=30,
+            action_dim=32,
+            use_correlated_noise=True,
+            correlation_beta=0.5,
+            use_fast_auxiliary=True,
+            fast_loss_weight=0.05,
+            fast_encoded_dims="0:6,7:23",
+            fast_vocab_size=1024,
+            max_fast_tokens=200,
+            use_kv_transform=True,
+            use_knowledge_insulation=False,
+            subtask_loss_weight=0.1,
+            freeze_vision_backbone=True,
+            num_tasks=100,
+        ),
+        sample_weights=[0.6, 0.4],
+        data=[
+            LeRobotB1KDataConfig(
+                repo_id="behavior-1k/2026-challenge-demos",
+                base_config=DataConfig(
+                    prompt_from_task=False,
+                    behavior_dataset_root=_behavior_dataset_root("2026-challenge-demos"),
+                    use_per_timestamp_norm=True,
+                    tasks=_2026_challenge_task_names(),
+                    episodes_index=list(range(200)),
+                    tolerance_s=1.0 / 30.0,
+                ),
+                use_delta_joint_actions=True,
+                use_fast_tokenization=True,
+            ),
+            LeRobotB1KDataConfig(
+                repo_id="delinqu/comet-1.5k",
+                assets=AssetsConfig(asset_id="behavior-1k/2026-challenge-demos"),
+                base_config=DataConfig(
+                    prompt_from_task=False,
+                    behavior_dataset_root=_behavior_dataset_root("comet-1.5k"),
+                    use_per_timestamp_norm=True,
+                    tasks=_2026_challenge_task_names(),
+                    align_legacy_rft_to_2026=True,
+                    tolerance_s=1.0 / 30.0,
+                ),
+                use_delta_joint_actions=True,
+                use_fast_tokenization=True,
+            ),
+        ],
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1000,
+            peak_lr=1e-4,
+            decay_steps=50_000,
+            decay_lr=1e-5,
+        ),
+        num_flow_samples=15,
+        weight_loader=weight_loaders.PiBehaviorWeightLoader(
+            "/workspace-SR008.nfs2/users/staroverov/.cache/openpi/openpi-assets/checkpoints/pi05_base/params"
+        ),
+        num_train_steps=2_000_000,
+        assets_base_dir="./outputs/assets",
+        checkpoint_base_dir="/workspace-SR008.nfs2/datasets/staroverov_b1k/behavior/b1k_solution",
+        num_workers=80,
+        batch_size=256,
+        fsdp_devices=8,
+        save_interval=5_000,
+        keep_period=50_000,
+        log_interval=25,
     ),
 ]
 

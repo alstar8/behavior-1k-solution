@@ -152,7 +152,7 @@ class PiBehavior(_model.BaseModel):
         self.subtask_encoding_dim = config.task_embedding_dim // 2  # Half of task embedding dim (1024)
         
         # Task-specific stage embeddings (one per stage per task)
-        # Total embeddings = sum of stages across all tasks (596 for 5-15 stages per task)
+        # Total embeddings = sum of stages across all tasks (1087 for 2026 100-task set)
         self.task_stage_embeddings = nnx.Embed(
             num_embeddings=TOTAL_TASK_STAGE_EMBEDDINGS,
             features=self.subtask_encoding_dim,

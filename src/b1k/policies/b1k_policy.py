@@ -12,7 +12,7 @@ import numpy as np
 
 from openpi import transforms
 from openpi.models import model as _model
-from omnigibson.learning.utils.eval_utils import PROPRIOCEPTION_INDICES
+from b1k.shared.b1k_proprio import extract_state_from_proprio, legacy_proprio_to_compact
 
 
 def make_b1k_example() -> dict:
@@ -24,37 +24,6 @@ def make_b1k_example() -> dict:
         "observation/joint_position": np.random.rand(23),
         "prompt": "do something",
     }
-
-def extract_state_from_proprio(proprio_data):
-    """
-    We assume perfect correlation for the two gripper fingers.
-    """
-    # extract joint position
-    base_qvel = proprio_data[..., PROPRIOCEPTION_INDICES["R1Pro"]["base_qvel"]]  # 3
-    trunk_qpos = proprio_data[..., PROPRIOCEPTION_INDICES["R1Pro"]["trunk_qpos"]]  # 4
-    arm_left_qpos = proprio_data[..., PROPRIOCEPTION_INDICES["R1Pro"]["arm_left_qpos"]]  #  7
-    arm_right_qpos = proprio_data[..., PROPRIOCEPTION_INDICES["R1Pro"]["arm_right_qpos"]]  #  7
-    
-    # Extract raw gripper widths and normalize to [-1, 1] to match action space
-    left_gripper_raw = proprio_data[..., PROPRIOCEPTION_INDICES["R1Pro"]["gripper_left_qpos"]].sum(axis=-1, keepdims=True)
-    right_gripper_raw = proprio_data[..., PROPRIOCEPTION_INDICES["R1Pro"]["gripper_right_qpos"]].sum(axis=-1, keepdims=True)
-    
-    # Normalize gripper widths from [0, 0.1] to [-1, 1] 
-    # Based on statistics: physical range is [0, 0.1], action range is [-1, 1]
-    # Formula: normalized = 2 * (raw / max_width) - 1
-    MAX_GRIPPER_WIDTH = 0.1  # From statistics q99 values
-    left_gripper_width = 2.0 * (left_gripper_raw / MAX_GRIPPER_WIDTH) - 1.0
-    right_gripper_width = 2.0 * (right_gripper_raw / MAX_GRIPPER_WIDTH) - 1.0
-
-    # Original baseline uses incorrect order for the state
-    return np.concatenate([
-        base_qvel,
-        trunk_qpos,
-        arm_left_qpos,
-        left_gripper_width,    # Now normalized [-1, 1]
-        arm_right_qpos,
-        right_gripper_width,   # Now normalized [-1, 1]
-    ], axis=-1)
 
 
 def _parse_image(image) -> np.ndarray:
@@ -73,8 +42,8 @@ class B1kInputs(transforms.DataTransformFn):
 
     def __call__(self, data: dict) -> dict:
 
-        proprio_data = data["observation/state"]
-        # extract joint position
+        proprio_data = legacy_proprio_to_compact(np.asarray(data["observation/state"]))
+        # extract joint position (61-d compact or 256-d legacy)
         state = extract_state_from_proprio(proprio_data)
         if "actions" in data:
             action =  data["actions"]
@@ -121,6 +90,8 @@ class B1kInputs(transforms.DataTransformFn):
             inputs["timestamp"] = data["timestamp"]
         if "episode_index" in data:
             inputs["episode_index"] = data["episode_index"]
+        if "episode_length" in data:
+            inputs["episode_length"] = data["episode_length"]
             
         # Preserve initial_actions for inpainting
         if "initial_actions" in data:

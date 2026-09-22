@@ -15,16 +15,9 @@ from openpi.training.data_loader import (
     IterableTransformedDataset,
     FakeDataset,
     TorchDataLoader,
-    RLDSDataLoader,
-    create_torch_dataset,
-    create_rlds_dataset,
-    transform_iterable_dataset,
-    create_data_loader,
-    create_torch_data_loader,
-    create_rlds_data_loader,
 )
 
-import openpi.training.config as _config
+from b1k.training import config as _config
 import openpi.transforms as _transforms
 
 from b1k.models.observation import Observation
@@ -34,7 +27,7 @@ from b1k.transforms_normalize import NormalizeWithPerTimestamp
 class DataLoaderImpl(DataLoader):
     """Custom DataLoader using our Observation with fast_tokens."""
     
-    def __init__(self, data_config: _config.DataConfig, data_loader: TorchDataLoader | RLDSDataLoader):
+    def __init__(self, data_config: _config.DataConfig, data_loader: TorchDataLoader):
         self._data_config = data_config
         self._data_loader = data_loader
 
@@ -46,83 +39,37 @@ class DataLoaderImpl(DataLoader):
             yield Observation.from_dict(batch), batch["actions"]
 
 
+def _episode_lengths_from_meta(dataset) -> dict[int, float]:
+    lengths: dict[int, float] = {}
+    meta = getattr(dataset, "meta", None)
+    episodes = getattr(meta, "episodes", None) if meta is not None else None
+    if not episodes:
+        return lengths
+    for episode_index, info in episodes.items():
+        length = info.get("length", info.get("episode_length", 0))
+        lengths[int(episode_index)] = float(length or 0)
+    return lengths
+
+
 def create_behavior_dataset(data_config: _config.DataConfig, action_horizon: int, seed: int | None = None) -> Dataset:
     """Create a BEHAVIOR-1K dataset for training.
-    
-    Uses OmniGibson's BehaviorLeRobotDataset for efficient loading of BEHAVIOR-1K data.
-    
-    Args:
-        data_config: Data configuration
-        action_horizon: Action horizon for delta timestamps
-        seed: Random seed for shuffling. If None, uses random seed based on current time.
-    
-    Returns:
-        Dataset instance with BEHAVIOR-1K data
+
+    Uses the 2026-capable BehaviorLeRobotDataset (LeRobot v3 parquet + 2025 jsonl).
     """
-    from omnigibson.learning.datas.lerobot_dataset import BehaviorLeRobotDataset
-    
-    # Use random seed if not provided
+    from b1k.datasets.lerobot_dataset import BehaviorLeRobotDataset
+    from b1k import transforms as b1k_transforms
+
     if seed is None:
         seed = int(time.time() * 1000) % (2**32)
         logging.info(f"Using random seed for BehaviorLeRobotDataset: {seed}")
-    tasks = [
-    "picking_up_trash", # difficulty: 2
-    "putting_away_Halloween_decorations", # difficulty: 3
-    "cleaning_up_plates_and_food", # difficulty: 3.5
-    "setting_mousetraps", # difficulty: 2
-    "hiding_Easter_eggs", # difficulty: 2
-    "set_up_a_coffee_station_in_your_kitchen", # difficulty: 3
-    "putting_dishes_away_after_cleaning", # difficulty: 3
-    "preparing_lunch_box", # difficulty: 3
-    "loading_the_car", # difficulty: 3.5
-    "carrying_in_groceries", # difficulty: 3.5
-    "turning_on_radio", # difficulty: 1
-    "picking_up_toys", # difficulty: 3.5
-    "can_meat", # difficulty: 3.5
-    "rearranging_kitchen_furniture", # difficulty: 3
-    "putting_up_Christmas_decorations_inside", # difficulty: 2
-    "bringing_in_wood", # difficulty: 1.5
-    "moving_boxes_to_storage", # difficulty: 1.5
-    "bringing_water", # difficulty: 1.5
-    "tidying_bedroom", # difficulty: 2
-    "outfit_a_basic_toolbox", # difficulty: 2,
-    "sorting_vegetables",
-    "collecting_childrens_toys",
-    "putting_shoes_on_rack",
-    "boxing_books_up_for_storage",
-    "storing_food",
-    "clearing_food_from_table_into_fridge",
-    "assembling_gift_baskets",
-    "sorting_household_items",
-    "getting_organized_for_work",
-    "clean_up_your_desk",
-    "setting_the_fire",
-    "clean_boxing_gloves",
-    "wash_a_baseball_cap",
-    "wash_dog_toys",
-    "hanging_pictures",
-    "attach_a_camera_to_a_tripod",
-    "clean_a_patio",
-    "clean_a_trumpet",
-    "spraying_for_bugs",
-    "spraying_fruit_trees",
-    "make_microwave_popcorn",
-    "cook_cabbage",
-    "make_pizza",
-    "chop_an_onion",
-    "slicing_vegetables",
-    "chopping_wood",
-    "canning_food",
-    "cook_hot_dogs",
-    "cook_bacon",
-    "freeze_pies",
-    ]
-    
+
+    tasks = data_config.tasks
+
     dataset = BehaviorLeRobotDataset(
         repo_id=data_config.repo_id,
         root=data_config.behavior_dataset_root,
         tasks=tasks,
-        modalities=["rgb"],
+        modalities=list(data_config.modalities) if data_config.modalities else ["rgb"],
         local_only=True,
         delta_timestamps={
             key: [t / 30.0 for t in range(action_horizon)] for key in data_config.action_sequence_keys
@@ -131,12 +78,37 @@ def create_behavior_dataset(data_config: _config.DataConfig, action_horizon: int
         chunk_streaming_using_keyframe=False,
         shuffle=True,
         seed=seed,
+        tolerance_s=getattr(data_config, "tolerance_s", 1.0 / 30.0),
+        check_timestamp_sync=False,
+        fine_grained_level=0,
     )
 
+    pre_transforms = []
+    if getattr(data_config, "align_legacy_rft_to_2026", False):
+        pre_transforms.append(b1k_transforms.AlignLegacyRftTo2026())
+    pre_transforms.append(
+        b1k_transforms.AttachEpisodeMetadata(
+            episode_lengths=_episode_lengths_from_meta(dataset),
+            force_task_index=getattr(data_config, "force_task_index", None),
+        )
+    )
+    dataset = TransformedDataset(dataset, pre_transforms)
+
     if data_config.prompt_from_task:
-        dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(dataset.meta.tasks)])
+        inner = dataset._dataset if hasattr(dataset, "_dataset") else dataset
+        if hasattr(inner, "meta") and hasattr(inner.meta, "tasks"):
+            dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(inner.meta.tasks)])
 
     return dataset
+
+
+def create_multi_behavior_dataset(
+    data_configs: list, sample_weights: list[float] | None, action_horizon: int, seed: int | None = None
+) -> Dataset:
+    from b1k.datasets.lerobot_dataset import MultiBehaviorLeRobotDataset
+
+    datasets = [create_behavior_dataset(data_config, action_horizon, seed=seed) for data_config in data_configs]
+    return MultiBehaviorLeRobotDataset(datasets, sample_weights=sample_weights)
 
 
 def transform_dataset(dataset: Dataset, data_config: _config.DataConfig, *, skip_norm_stats: bool = False) -> Dataset:
@@ -166,18 +138,12 @@ def transform_dataset(dataset: Dataset, data_config: _config.DataConfig, *, skip
         ),
     ]
     
-    # Add subtask state computation for PI_BEHAVIOR models (needs dataset reference)
+    # Add subtask state computation for PI_BEHAVIOR models
     model_transforms = []
     for transform in data_config.model_transforms.inputs:
-        # ComputeSubtaskStateFromMeta needs dataset reference to access episode lengths
-        if hasattr(transform, '__class__') and transform.__class__.__name__ == 'ComputeSubtaskStateFromMeta':
-            # Replace placeholder with dataset-aware version
+        if hasattr(transform, "__class__") and transform.__class__.__name__ == "ComputeSubtaskStateFromMeta":
             from b1k import transforms as b1k_transforms
-            if hasattr(dataset, 'meta') and hasattr(dataset.meta, 'episodes'):
-                model_transforms.append(b1k_transforms.ComputeSubtaskStateFromMeta(dataset=dataset))
-                logging.info("Added dataset-aware ComputeSubtaskStateFromMeta transform")
-            else:
-                logging.warning("Skipping subtask state computation - dataset has no meta.episodes")
+            model_transforms.append(b1k_transforms.ComputeSubtaskStateFromMeta(dataset=dataset))
         else:
             model_transforms.append(transform)
     
@@ -231,15 +197,24 @@ def create_behavior_data_loader(
     import jax
     import time
     
-    data_config = config.data.create(config.assets_dirs, config.model)
-    
-    # Use random seed if not provided
+    factories = _config.get_data_factories(config)
+    data_configs = [factory.create(config.assets_dirs, config.model) for factory in factories]
+    data_config = data_configs[0]
+
     seed = config.seed
     if seed is None:
         seed = int(time.time() * 1000) % (2**32)
         logging.info(f"Using random seed: {seed}")
-    
-    dataset = create_behavior_dataset(data_config, action_horizon=config.model.action_horizon, seed=seed)
+
+    if len(data_configs) > 1:
+        dataset = create_multi_behavior_dataset(
+            data_configs,
+            sample_weights=getattr(config, "sample_weights", None),
+            action_horizon=config.model.action_horizon,
+            seed=seed,
+        )
+    else:
+        dataset = create_behavior_dataset(data_config, action_horizon=config.model.action_horizon, seed=seed)
     dataset = transform_dataset(dataset, data_config, skip_norm_stats=skip_norm_stats)
 
     data_loader = TorchDataLoader(

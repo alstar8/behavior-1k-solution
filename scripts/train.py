@@ -188,6 +188,13 @@ def init_train_state(
     partial_params = _load_weights_and_validate(config.weight_loader, train_state_shape.params.to_pure_dict())
     replicated_sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
 
+    # FSDP checkpoints restore with their saved partition spec. The init jit
+    # expects fully replicated inputs, then reshardes the train state.
+    partial_params = jax.tree.map(
+        lambda x: jax.device_put(x, replicated_sharding) if isinstance(x, jax.Array) else x,
+        partial_params,
+    )
+
     # Initialize the train state and mix in the partial params.
     train_state = jax.jit(
         init,
@@ -433,7 +440,13 @@ def main(config: _config.TrainConfig):
             # Create a concise console log with main metrics
             main_metrics = {k: v for k, v in reduced_info.items() 
                           if "loss" in k or "accuracy" in k or k in ["grad_norm", "param_norm", "grad_norm_vlm", "grad_norm_action_expert"]}
-            info_str = ", ".join(f"{k}={v:.4f}" for k, v in main_metrics.items())
+            parts = []
+            for k, v in main_metrics.items():
+                try:
+                    parts.append(f"{k}={float(v):.4f}")
+                except (TypeError, ValueError):
+                    parts.append(f"{k}={v}")
+            info_str = ", ".join(parts)
             pbar.write(f"Step {step}: {info_str}")
             wandb.log(reduced_info, step=step)
             infos = []

@@ -36,6 +36,39 @@ from openpi.transforms import (
 
 from b1k.models.pi_behavior_config import TASK_NUM_STAGES
 from b1k.shared.normalize import NormStats
+from b1k.shared.b1k_proprio import legacy_proprio_to_compact
+
+
+@dataclasses.dataclass(frozen=True)
+class AlignLegacyRftTo2026(DataTransformFn):
+    """Rewrite one old-B1K (Comet RFT) sample into the 2026 compact proprio format.
+
+    256-d world-frame proprio → 61-d compact with holonomic base_qvel in the robot frame.
+    Actions are already the 23-d BEHAVIOR layout and are left unchanged.
+    """
+
+    def __call__(self, data: DataDict) -> DataDict:
+        data = dict(data)
+        for key in ("observation.state", "observation/state"):
+            if key in data:
+                data[key] = legacy_proprio_to_compact(np.asarray(data[key]))
+        return data
+
+
+@dataclasses.dataclass(frozen=True)
+class AttachEpisodeMetadata(DataTransformFn):
+    """Attach episode length and optionally pin task_index (radio specialist = 0)."""
+
+    episode_lengths: dict[int, float]
+    force_task_index: int | None = None
+
+    def __call__(self, data: DataDict) -> DataDict:
+        data = dict(data)
+        episode_index = int(np.asarray(data["episode_index"]).reshape(-1)[0])
+        data["episode_length"] = np.array(self.episode_lengths.get(episode_index, 0.0), dtype=np.float32)
+        if self.force_task_index is not None:
+            data["task_index"] = np.array(self.force_task_index, dtype=np.int32)
+        return data
 
 
 @dataclasses.dataclass(frozen=True)
@@ -121,67 +154,38 @@ class ComputeSubtaskStateFromMeta(DataTransformFn):
     dataset: object | None = None  # Will be set by data loader
     
     def __call__(self, data: DataDict) -> DataDict:
-        if self.dataset is None:
-            # During inference or when dataset is not available, use default
+        data = dict(data)
+        if "episode_index" not in data or "timestamp" not in data:
             data["subtask_state"] = np.array(0, dtype=np.int32)
             return data
-        
-        if "episode_index" not in data or "timestamp" not in data or "task_index" not in data:
-            # Missing required fields, default to stage 0
-            data["subtask_state"] = np.array(0, dtype=np.int32)
-            return data
-        
-        episode_index = int(data["episode_index"])
-        timestamp = float(data["timestamp"])
-        task_index = int(data["task_index"])
-        
-        # Validate task_index
-        if not (0 <= task_index < 50):
+
+        timestamp = float(np.asarray(data["timestamp"]).reshape(-1)[0])
+        task_index = int(np.asarray(data.get("task_index", 0)).reshape(-1)[0])
+        if not (0 <= task_index < len(TASK_NUM_STAGES)):
             logging.warning(f"Invalid task_index {task_index}, using stage 0")
             data["subtask_state"] = np.array(0, dtype=np.int32)
             return data
-        
-        # Get number of stages for this task
+
         num_stages = TASK_NUM_STAGES[task_index]
-        
-        # Get episode length from dataset metadata
-        if not hasattr(self.dataset, 'meta') or not hasattr(self.dataset.meta, 'episodes'):
-            # No metadata available
-            data["subtask_state"] = np.array(0, dtype=np.int32)
-            return data
-            
-        meta_episodes = self.dataset.meta.episodes
-        
-        if episode_index not in meta_episodes:
-            logging.warning(f"Episode {episode_index} not found in metadata, using stage 0")
-            data["subtask_state"] = np.array(0, dtype=np.int32)
-            return data
-            
-        episode_info = meta_episodes[episode_index]
-        
-        # Try 'length' first (standard key), then 'episode_length' (alternative)
-        episode_length = episode_info.get('length', episode_info.get('episode_length', None))
-        
+        episode_length = None
+        if "episode_length" in data:
+            episode_length = float(np.asarray(data["episode_length"]).reshape(-1)[0])
+        elif self.dataset is not None and hasattr(self.dataset, "meta") and hasattr(self.dataset.meta, "episodes"):
+            episode_index = int(data["episode_index"])
+            episode_info = self.dataset.meta.episodes.get(episode_index, {})
+            episode_length = episode_info.get("length", episode_info.get("episode_length", None))
+            if episode_length is not None:
+                episode_length = float(episode_length)
+
         if episode_length is None or episode_length <= 0:
-            logging.warning(f"Invalid episode_length for episode {episode_index}, using stage 0")
             data["subtask_state"] = np.array(0, dtype=np.int32)
             return data
-        
-        episode_length = float(episode_length)
-        
-        # CRITICAL: Convert timestamp (in seconds) to frames (30 FPS)
-        # Dataset provides timestamp in seconds, episode_length is in frames
+
+        # Dataset timestamp is seconds; episode_length is frames at 30 FPS.
         current_step = timestamp * 30.0
-        
-        # Divide episode into num_stages equal parts
         frames_per_stage = episode_length / num_stages
-        
-        # Compute current stage (0-indexed)
         subtask_state = int(current_step / frames_per_stage)
-        
-        # Clamp to valid range [0, num_stages-1]
         subtask_state = max(0, min(subtask_state, num_stages - 1))
-        
         data["subtask_state"] = np.array(subtask_state, dtype=np.int32)
         return data
 

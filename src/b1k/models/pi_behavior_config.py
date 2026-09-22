@@ -24,18 +24,23 @@ if TYPE_CHECKING:
     from b1k.models.pi_behavior import PiBehavior
 
 
-# Per-task stage counts (based on avg_episode_length / 900, capped between 5-15)
-# Use tuple for immutability and to avoid JAX device allocation at import time
+# Per-task stage counts for the 2026 100-task challenge
+# (mean episode length / 900, rounded and clipped to [5, 15]).
 TASK_NUM_STAGES = (
-    5, 6, 15, 15, 14, 12, 9, 15, 10, 15,  # Tasks 0-9
-    7, 13, 10, 15, 15, 15, 15, 11, 13, 12,  # Tasks 10-19
-    14, 15, 9, 15, 15, 15, 15, 15, 15, 15,  # Tasks 20-29
-    11, 10, 10, 13, 5, 5, 14, 6, 8, 10,  # Tasks 30-39
-    5, 15, 8, 15, 12, 11, 9, 14, 15, 15,  # Tasks 40-49
+    5, 6, 15, 15, 13, 11, 8, 15, 10, 15,  # 0-9
+    7, 12, 9, 15, 15, 15, 15, 10, 12, 12,  # 10-19
+    13, 15, 9, 15, 15, 15, 15, 15, 15, 15,  # 20-29
+    10, 9, 9, 12, 5, 5, 13, 6, 7, 9,  # 30-39
+    5, 15, 7, 15, 12, 10, 9, 14, 15, 15,  # 40-49
+    14, 8, 11, 14, 13, 11, 5, 5, 15, 7,  # 50-59
+    5, 12, 7, 5, 15, 13, 11, 7, 14, 5,  # 60-69
+    9, 15, 10, 15, 12, 13, 10, 5, 5, 12,  # 70-79
+    10, 10, 9, 8, 14, 13, 11, 11, 14, 5,  # 80-89
+    5, 11, 5, 5, 15, 15, 5, 15, 15, 9,  # 90-99
 )
 
 MAX_NUM_STAGES = 15  # Maximum stages per task
-TOTAL_TASK_STAGE_EMBEDDINGS = sum(TASK_NUM_STAGES)  # 596 total embeddings
+TOTAL_TASK_STAGE_EMBEDDINGS = sum(TASK_NUM_STAGES)  # 1087 for 2026 100-task set
 
 # Cumulative offsets for indexing into task_stage_embeddings (as tuple)
 TASK_STAGE_OFFSETS = tuple([0] + [sum(TASK_NUM_STAGES[:i+1]) for i in range(len(TASK_NUM_STAGES) - 1)])
@@ -53,7 +58,7 @@ class PiBehaviorConfig(_model.BaseModelConfig):
     max_token_len: int = 200  # Only used for compatibility, not for actual tokenization
     
     # Number of tasks in the behavior dataset
-    num_tasks: int = 50
+    num_tasks: int = 100
     # Task embedding dimension - will match the paligemma width
     task_embedding_dim: int = None  # type: ignore
     # Maximum number of subtask states across all tasks
@@ -109,6 +114,21 @@ class PiBehaviorConfig(_model.BaseModelConfig):
     
     # Vision backbone finetuning control
     freeze_vision_backbone: bool = True
+
+    def get_task_and_system2_freeze_filter(self) -> nnx.filterlib.Filter:
+        """Freeze task embeddings and System-2 stage modules during specialist finetuning."""
+        from openpi.shared import nnx_utils
+
+        return nnx.Any(
+            nnx_utils.PathRegex(".*task_embeddings.*"),
+            nnx_utils.PathRegex(".*task_stage_embeddings.*"),
+            nnx_utils.PathRegex(".*stage_pred_from_vlm.*"),
+            nnx_utils.PathRegex(".*gate_sincos.*"),
+            nnx_utils.PathRegex(".*gate_task_stage.*"),
+            nnx_utils.PathRegex(".*gate_task.*"),
+            nnx_utils.PathRegex(".*fusion_layer.*"),
+            nnx_utils.PathRegex(".*stage_projection.*"),
+        )
 
     def __post_init__(self):
         if self.task_embedding_dim is None:

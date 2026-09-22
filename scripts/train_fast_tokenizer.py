@@ -8,6 +8,10 @@ This script:
 5. Reports compression statistics
 """
 
+import os
+
+os.environ.setdefault("JAX_PLATFORMS", "cpu")
+
 import json
 import numpy as np
 import pandas as pd
@@ -20,13 +24,14 @@ import openpi.transforms as transforms
 
 # Import B1K-specific modules
 from b1k.training import config as _config
-from b1k.policies.b1k_policy import extract_state_from_proprio
+from b1k.shared.b1k_proprio import extract_state_from_proprio, legacy_proprio_to_compact
 
 
 def get_delta_transform_from_config(config_name: str):
     """Get the delta action transform from config."""
     config = _config.get_config(config_name)
-    data_config = config.data.create(config.assets_dirs, config.model)
+    factory = _config.get_data_factories(config)[0]
+    data_config = factory.create(config.assets_dirs, config.model)
     
     delta_transform = None
     for transform in data_config.data_transforms.inputs:
@@ -55,61 +60,49 @@ def apply_delta_transform(state: np.ndarray, actions: np.ndarray, mask) -> np.nd
 
 def process_episode_file(args):
     """Process episode file and return action chunks."""
-    episode_file, delta_mask, action_horizon, sample_fraction = args
+    episode_file, delta_mask, action_horizon, sample_fraction, align_legacy = args
     
     try:
         df = pd.read_parquet(episode_file)
-        
-        states = []
-        raw_actions = []
-        
-        for _, row in df.iterrows():
-            raw_state = np.array(row["observation.state"])
-            raw_action = np.array(row["action"])
-            
-            processed_state = extract_state_from_proprio(raw_state)
-            
-            states.append(processed_state)
-            raw_actions.append(raw_action)
-        
-        if len(raw_actions) < action_horizon:
+        if "episode_index" in df.columns:
+            groups = list(df.groupby("episode_index", sort=True))
+        else:
+            groups = [(0, df)]
+
+        all_chunks = []
+        for _, ep_df in groups:
+            raw_state = np.asarray(ep_df["observation.state"].tolist(), dtype=np.float32)
+            raw_actions = np.asarray(ep_df["action"].tolist(), dtype=np.float32)
+            if align_legacy:
+                raw_state = legacy_proprio_to_compact(raw_state)
+            states = extract_state_from_proprio(raw_state)
+            if states.ndim == 1:
+                states = states[None, :]
+                raw_actions = raw_actions[None, :]
+
+            if len(raw_actions) < action_horizon:
+                continue
+
+            mask = np.asarray(delta_mask)
+            dims = mask.shape[-1]
+            windows = np.lib.stride_tricks.sliding_window_view(raw_actions, (action_horizon, raw_actions.shape[1]))[:, 0]
+            state_exp = states[: windows.shape[0], None, :]
+            action_chunks = windows.copy()
+            action_chunks[..., :dims] = np.where(
+                mask, windows[..., :dims] - state_exp[..., :dims], windows[..., :dims]
+            )
+            if sample_fraction < 1.0:
+                n_chunks = len(action_chunks)
+                n_samples = max(1, int(n_chunks * sample_fraction))
+                episode_seed = hash(str(episode_file)) % (2**31)
+                rng = np.random.RandomState(episode_seed)
+                indices = rng.choice(n_chunks, size=n_samples, replace=False)
+                action_chunks = action_chunks[indices]
+            all_chunks.append(action_chunks)
+
+        if not all_chunks:
             return None
-        
-        states = np.array(states)
-        raw_actions = np.array(raw_actions)
-        
-        # Create action chunks (sliding window)
-        # IMPORTANT: Apply delta transform the SAME way as compute_norm_stats
-        # All actions in a chunk are relative to the FIRST state in that chunk
-        action_chunks = []
-        for i in range(len(states) - action_horizon + 1):
-            current_state = states[i]  # First state in chunk
-            future_absolute_actions = raw_actions[i:i + action_horizon]
-            
-            # Apply delta transform to each action using the SAME current state
-            delta_chunk = np.zeros_like(future_absolute_actions)
-            for t in range(action_horizon):
-                delta_chunk[t] = apply_delta_transform(current_state, future_absolute_actions[t], delta_mask)
-            
-            action_chunks.append(delta_chunk)
-        
-        if len(action_chunks) == 0:
-            return None
-        
-        action_chunks = np.array(action_chunks)
-        
-        # Sample chunks
-        if sample_fraction < 1.0:
-            n_chunks = len(action_chunks)
-            n_samples = max(1, int(n_chunks * sample_fraction))
-            # Use hash of episode filename as seed for randomness across episodes
-            # Use same modulo as compute_norm_stats.py for consistency
-            episode_seed = hash(str(episode_file)) % (2**31)
-            rng = np.random.RandomState(episode_seed)
-            indices = rng.choice(n_chunks, size=n_samples, replace=False)
-            action_chunks = action_chunks[indices]
-        
-        return action_chunks
+        return np.concatenate(all_chunks, axis=0)
         
     except Exception as e:
         print(f"Error processing {episode_file}: {e}")
@@ -232,7 +225,8 @@ def main(
     """
     # Load config
     config = _config.get_config(config_name)
-    data_config = config.data.create(config.assets_dirs, config.model)
+    factory = _config.get_data_factories(config)[0]
+    data_config = factory.create(config.assets_dirs, config.model)
     
     if not data_config.behavior_dataset_root:
         raise ValueError("This script only works with B1K behavior datasets")
@@ -254,34 +248,49 @@ def main(
     print(f"Action horizon: {action_horizon}")
     print(f"Delta mask: {delta_mask}")
     
-    # Find episode files
-    data_root = Path(data_config.behavior_dataset_root)
-    all_episode_files = sorted(data_root.glob("data/task-*/episode_*.parquet"))
+    jobs = []
+    for src_factory in _config.get_data_factories(config):
+        base = src_factory.base_config or _config.DataConfig()
+        root = Path(str(base.behavior_dataset_root)).expanduser()
+        tasks = getattr(base, "tasks", None)
+        align_legacy = bool(getattr(base, "align_legacy_rft_to_2026", False))
+        chunk_files = sorted(root.glob("data/chunk-*/file-*.parquet"))
+        episode_files = sorted(root.glob("data/task-*/episode_*.parquet"))
+        if tasks == ["turning_on_radio"]:
+            chunk_files = [path for path in chunk_files if "chunk-000" in str(path)]
+            episode_files = [path for path in episode_files if "task-0000" in str(path)]
+        files = chunk_files + episode_files
+        print(f"Found {len(files)} parquet files under {root} (align_legacy={align_legacy})")
+        for path in files:
+            jobs.append((path, delta_mask, action_horizon, sample_fraction, align_legacy))
 
-    episode_files = all_episode_files
-    print(f"Using all {len(episode_files)} episodes")
-    
     if max_episodes is not None:
-        episode_files = episode_files[:max_episodes]
-        print(f"Limited to {len(episode_files)} episodes")
-    
-    # Process episodes in parallel
-    num_workers = num_workers or min(32, len(episode_files))
-    args_list = [
-        (f, delta_mask, action_horizon, sample_fraction)
-        for f in episode_files
-    ]
-    
-    print(f"\nProcessing episodes with {num_workers} workers...")
+        jobs = jobs[:max_episodes]
+        print(f"Limited to {len(jobs)} files")
+
+    if not jobs:
+        raise ValueError("No episode files found")
+
+    import multiprocessing as mp
+
+    num_workers = num_workers or min(16, len(jobs))
+    num_workers = max(1, min(num_workers, 16, len(jobs)))
+    print(f"\nProcessing {len(jobs)} files with {num_workers} workers...")
     all_chunks = []
-    with ProcessPoolExecutor(max_workers=num_workers) as executor:
-        for chunks in executor.map(process_episode_file, args_list):
+    with ProcessPoolExecutor(max_workers=num_workers, mp_context=mp.get_context("spawn")) as executor:
+        for chunks in executor.map(process_episode_file, jobs):
             if chunks is not None:
                 all_chunks.append(chunks)
     
     # Concatenate all chunks
     all_chunks = np.concatenate(all_chunks, axis=0)
     print(f"Collected {len(all_chunks)} action chunks")
+    max_fast_chunks = 80_000
+    if len(all_chunks) > max_fast_chunks:
+        rng = np.random.RandomState(42)
+        indices = rng.choice(len(all_chunks), size=max_fast_chunks, replace=False)
+        all_chunks = all_chunks[indices]
+        print(f"Subsampled FAST tokenizer data to {len(all_chunks)} chunks")
     
     # Extract only encoded dimensions FIRST (before denorm/renorm)
     encoded_chunks = []

@@ -4,10 +4,15 @@ Computes mean, std, min, max from dataset in parallel.
 Supports per-timestamp normalization and action correlation matrices.
 """
 
+import os
+
+os.environ.setdefault("JAX_PLATFORMS", "cpu")
+
 import numpy as np
 import pandas as pd
 import tyro
 from pathlib import Path
+import os
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import multiprocessing as mp
 
@@ -17,13 +22,14 @@ import openpi.transforms as transforms
 # Import B1K-specific modules  
 from b1k.shared import normalize
 from b1k.training import config as _config
-from b1k.policies.b1k_policy import extract_state_from_proprio
+from b1k.shared.b1k_proprio import extract_state_from_proprio, legacy_proprio_to_compact
 
 
 def get_delta_transform_from_config(config_name: str):
     """Get the delta action transform from the config."""
     config = _config.get_config(config_name)
-    data_config = config.data.create(config.assets_dirs, config.model)
+    factory = _config.get_data_factories(config)[0]
+    data_config = factory.create(config.assets_dirs, config.model)
     
     # Find the DeltaActions transform in the data transforms
     delta_transform = None
@@ -62,103 +68,132 @@ def apply_delta_transform_from_config(state: np.ndarray, actions: np.ndarray, ma
     return delta_actions
 
 
+def _iter_data_sources(config):
+    for factory in _config.get_data_factories(config):
+        base = factory.base_config or _config.DataConfig()
+        root = Path(os.path.expanduser(str(base.behavior_dataset_root)))
+        yield root, bool(getattr(base, "align_legacy_rft_to_2026", False)), getattr(base, "tasks", None)
+
+
+def find_episode_parquets(root: Path, tasks: list[str] | None) -> list[Path]:
+    chunk_files = sorted(root.glob("data/chunk-*/file-*.parquet"))
+    episode_files = sorted(root.glob("data/task-*/episode_*.parquet"))
+    if tasks == ["turning_on_radio"]:
+        chunk_files = [path for path in chunk_files if "chunk-000" in str(path)]
+        episode_files = [path for path in episode_files if "task-0000" in str(path)]
+    return chunk_files + episode_files
+
+
 def process_episode_file(args):
-    """Process a single episode file and return statistics."""
-    episode_file, delta_mask, action_horizon, compute_per_timestamp, compute_correlation, sample_fraction = args
-    
+    """Process a parquet file (one or many episodes) and return statistics."""
+    episode_file, delta_mask, action_horizon, compute_per_timestamp, compute_correlation, sample_fraction, align_legacy = args
+
     try:
-        # Read parquet file directly
         df = pd.read_parquet(episode_file)
-        
-        # Extract states and actions
-        states = []
-        raw_actions = []  # Keep raw actions for per-timestamp processing
-        actions = []
-        
-        for _, row in df.iterrows():
-            # Get raw proprioception and actions
-            raw_state = np.array(row["observation.state"])  # 256-dim
-            raw_action = np.array(row["action"])            # 23-dim
-            
-            # Apply state extraction (same as training/inference)
-            processed_state = extract_state_from_proprio(raw_state)  # 23-dim
-            
-            # Apply delta transform to actions (for regular statistics)
-            delta_action = apply_delta_transform_from_config(processed_state, raw_action, delta_mask)
-            
-            states.append(processed_state)
-            raw_actions.append(raw_action)
-            actions.append(delta_action)
-        
-        if len(states) == 0:
+        if "episode_index" in df.columns:
+            groups = list(df.groupby("episode_index", sort=True))
+        else:
+            groups = [(0, df)]
+
+        file_stats = []
+        file_data = []
+        for _, ep_df in groups:
+            result = _process_episode_frames(
+                ep_df,
+                delta_mask,
+                action_horizon,
+                compute_per_timestamp,
+                compute_correlation,
+                sample_fraction,
+                align_legacy,
+                episode_file,
+            )
+            if result is not None:
+                stats, data = result
+                file_stats.append(stats)
+                file_data.append(data)
+        if not file_stats:
             return None, None
-            
-        states = np.array(states)
-        raw_actions = np.array(raw_actions)
-        actions = np.array(actions)
-        
-        # Compute episode statistics (including min/max which we'll use instead of quantiles)
-        episode_stats = {
-            "state": {
-                "count": len(states),
-                "sum": np.sum(states, axis=0),
-                "sum_sq": np.sum(states**2, axis=0),
-                "min": np.min(states, axis=0),
-                "max": np.max(states, axis=0),
-            },
-            "actions": {
-                "count": len(actions),
-                "sum": np.sum(actions, axis=0),
-                "sum_sq": np.sum(actions**2, axis=0),
-                "min": np.min(actions, axis=0),
-                "max": np.max(actions, axis=0),
-            }
-        }
-        
-        # Compute per-timestamp statistics and action chunks if requested
-        per_timestamp_data = None
-        correlation_chunks = None
-        if compute_per_timestamp or compute_correlation:
-            # Create action chunks for per-timestamp statistics
-            # For each timestep, take the current state and next action_horizon absolute actions
-            action_chunks = []
-            for i in range(len(states) - action_horizon + 1):
-                current_state = states[i]  # State at time i
-                # Take next action_horizon absolute actions starting from time i
-                future_absolute_actions = raw_actions[i:i + action_horizon]  # Shape: (action_horizon, action_dim)
-                
-                # Apply delta transform to each action using the SAME current state
-                delta_chunk = np.zeros_like(future_absolute_actions)
-                for t in range(action_horizon):
-                    delta_chunk[t] = apply_delta_transform_from_config(current_state, future_absolute_actions[t], delta_mask)
-                
-                action_chunks.append(delta_chunk)
-            
-            if action_chunks:
-                action_chunks = np.array(action_chunks)  # Shape: (num_chunks, action_horizon, action_dim)
-                
-                # Sample chunks (not individual actions!) to reduce memory usage
-                # Use fixed seed per episode for reproducibility
-                rng = np.random.RandomState(hash(str(episode_file)) % (2**31))
-                n_chunk_samples = max(1, int(len(action_chunks) * sample_fraction))
-                
-                if sample_fraction < 1.0 and n_chunk_samples < len(action_chunks):
-                    chunk_indices = rng.choice(len(action_chunks), size=n_chunk_samples, replace=False)
-                    sampled_chunks = action_chunks[chunk_indices]
-                else:
-                    sampled_chunks = action_chunks
-                
-                if compute_per_timestamp:
-                    per_timestamp_data = sampled_chunks
-                if compute_correlation:
-                    correlation_chunks = sampled_chunks
-        
-        # Don't return full states/actions to save memory - we have everything we need in episode_stats
-        return episode_stats, (per_timestamp_data, correlation_chunks)
-        
+        return file_stats, file_data
+
     except Exception as e:
         print(f"Error processing {episode_file}: {e}")
         return None, None
+
+
+def _as_2d_float(series) -> np.ndarray:
+    values = series.tolist()
+    return np.asarray(values, dtype=np.float32)
+
+
+def _process_episode_frames(
+    df,
+    delta_mask,
+    action_horizon,
+    compute_per_timestamp,
+    compute_correlation,
+    sample_fraction,
+    align_legacy,
+    episode_file,
+):
+    raw_state = _as_2d_float(df["observation.state"])
+    raw_actions = _as_2d_float(df["action"])
+    if align_legacy:
+        raw_state = legacy_proprio_to_compact(raw_state)
+    states = extract_state_from_proprio(raw_state)
+    if states.ndim == 1:
+        states = states[None, :]
+        raw_actions = raw_actions[None, :]
+        raw_state = raw_state[None, :]
+
+    mask = np.asarray(delta_mask)
+    dims = mask.shape[-1]
+    actions = raw_actions.copy()
+    actions[:, :dims] = np.where(mask, raw_actions[:, :dims] - states[:, :dims], raw_actions[:, :dims])
+
+    if len(states) == 0:
+        return None
+
+    episode_stats = {
+        "state": {
+            "count": len(states),
+            "sum": np.sum(states, axis=0),
+            "sum_sq": np.sum(states**2, axis=0),
+            "min": np.min(states, axis=0),
+            "max": np.max(states, axis=0),
+        },
+        "actions": {
+            "count": len(actions),
+            "sum": np.sum(actions, axis=0),
+            "sum_sq": np.sum(actions**2, axis=0),
+            "min": np.min(actions, axis=0),
+            "max": np.max(actions, axis=0),
+        }
+    }
+
+    per_timestamp_data = None
+    correlation_chunks = None
+    if (compute_per_timestamp or compute_correlation) and len(states) >= action_horizon:
+        horizon = action_horizon
+        windows = np.lib.stride_tricks.sliding_window_view(raw_actions, (horizon, raw_actions.shape[1]))[:, 0]
+        state_exp = states[: windows.shape[0], None, :]
+        delta_chunks = windows.copy()
+        delta_chunks[..., :dims] = np.where(
+            mask, windows[..., :dims] - state_exp[..., :dims], windows[..., :dims]
+        )
+        rng = np.random.RandomState(hash(str(episode_file)) % (2**31))
+        n_chunk_samples = max(1, int(len(delta_chunks) * sample_fraction))
+        if sample_fraction < 1.0 and n_chunk_samples < len(delta_chunks):
+            chunk_indices = rng.choice(len(delta_chunks), size=n_chunk_samples, replace=False)
+            sampled_chunks = delta_chunks[chunk_indices]
+        else:
+            sampled_chunks = delta_chunks
+        if compute_per_timestamp:
+            per_timestamp_data = sampled_chunks
+        if compute_correlation:
+            correlation_chunks = sampled_chunks
+
+    return episode_stats, (per_timestamp_data, correlation_chunks)
 
 
 def aggregate_episode_stats(episode_stats_list, all_data_list, config, compute_correlation=False, max_correlation_samples=2000000, compute_quantiles_sample_size=1000000):
@@ -477,7 +512,8 @@ def main(
     """
     
     config = _config.get_config(config_name)
-    data_config = config.data.create(config.assets_dirs, config.model)
+    factory = _config.get_data_factories(config)[0]
+    data_config = factory.create(config.assets_dirs, config.model)
     
     if not data_config.behavior_dataset_root:
         raise ValueError("This script only works with B1K behavior datasets")
@@ -504,64 +540,51 @@ def main(
     else:
         print(f"Using all action chunks (no sampling) - this may cause OOM on large datasets")
     
-    # Find all episode parquet files
-    data_root = Path(data_config.behavior_dataset_root)
-    print(f"Looking for episode files in: {data_root}/data/task-*/episode_*.parquet")
-    
-    episode_files = list(data_root.glob("data/task-*/episode_*.parquet"))
-    print(f"Found {len(episode_files)} total episode files")
-    
+    jobs = []
+    for root, align_legacy, tasks in _iter_data_sources(config):
+        files = find_episode_parquets(root, tasks)
+        print(f"Found {len(files)} parquet files under {root} (align_legacy={align_legacy})")
+        for episode_file in files:
+            jobs.append((episode_file, delta_transform.mask, action_horizon, compute_per_timestamp, compute_correlation, sample_fraction, align_legacy))
+
     if max_episodes is not None:
-        episode_files = episode_files[:max_episodes]
-        print(f"Limited to {len(episode_files)} files based on max_episodes")
-    
-    if len(episode_files) == 0:
-        print("No episode files found! Checking directory structure...")
-        print(f"Contents of {data_root}:")
-        for item in data_root.iterdir():
-            print(f"  {item}")
-        if (data_root / "data").exists():
-            print(f"Contents of {data_root}/data:")
-            for item in (data_root / "data").iterdir():
-                print(f"  {item}")
-        raise ValueError("No episode files found")
-    
-    print(f"Processing {len(episode_files)} episode files...")
-    
-    # Set up parallel processing
+        jobs = jobs[:max_episodes]
+        print(f"Limited to {len(jobs)} files based on max_episodes")
+
+    if not jobs:
+        raise ValueError("No episode files found in configured dataset roots")
+
+    print(f"Processing {len(jobs)} parquet files...")
+
     if num_workers is None:
-        num_workers = min(mp.cpu_count(), len(episode_files))
-    
-    # Ensure at least 1 worker
-    num_workers = max(1, num_workers)
+        num_workers = min(16, mp.cpu_count(), len(jobs))
+    num_workers = max(1, min(num_workers, 16, len(jobs)))
     print(f"Using {num_workers} workers")
-    
-    # Process episodes in parallel
+
     episode_stats_list = []
     all_data_list = []
-    
-    with ProcessPoolExecutor(max_workers=num_workers) as executor:
-        # Submit all jobs
+
+    with ProcessPoolExecutor(max_workers=num_workers, mp_context=mp.get_context("spawn")) as executor:
         future_to_file = {
-            executor.submit(process_episode_file, (episode_file, delta_transform.mask, action_horizon, compute_per_timestamp, compute_correlation, sample_fraction)): episode_file 
-            for episode_file in episode_files
+            executor.submit(process_episode_file, job): job[0]
+            for job in jobs
         }
-        
-        # Collect results
         for future in as_completed(future_to_file):
             episode_file = future_to_file[future]
             try:
                 episode_stats, episode_data = future.result()
                 if episode_stats is not None:
-                    episode_stats_list.append(episode_stats)
-                    all_data_list.append(episode_data)
-                    
+                    if isinstance(episode_stats, list):
+                        episode_stats_list.extend(episode_stats)
+                        all_data_list.extend(episode_data)
+                    else:
+                        episode_stats_list.append(episode_stats)
+                        all_data_list.append(episode_data)
                 if len(episode_stats_list) % 10 == 0:
                     print(f"Processed {len(episode_stats_list)} episodes...")
-                    
             except Exception as e:
                 print(f"Error processing {episode_file}: {e}")
-    
+
     print(f"Successfully processed {len(episode_stats_list)} episodes")
     
     # Aggregate all statistics
