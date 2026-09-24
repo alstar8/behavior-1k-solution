@@ -48,8 +48,12 @@ def create_trained_policy(
     # JAX model loading - load directly as bfloat16 to save memory (12GB vs 24GB)
     model = train_config.model.load(_model.restore_params(checkpoint_dir / "params", dtype=jnp.bfloat16))
     
-    # Get data config
-    data_config = train_config.data.create(train_config.assets_dirs, train_config.model)
+    # Get data config. Specialist configs store a list of dataset factories;
+    # norm stats and transforms are shared, so the first factory is enough.
+    data_factory = train_config.data
+    if isinstance(data_factory, (list, tuple)):
+        data_factory = data_factory[0]
+    data_config = data_factory.create(train_config.assets_dirs, train_config.model)
     
     # Load norm stats if not provided
     if norm_stats is None:
