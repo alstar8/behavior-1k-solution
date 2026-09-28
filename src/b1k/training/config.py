@@ -95,6 +95,8 @@ class DataConfig:
     align_legacy_rft_to_2026: bool = False
     # If set, overwrite sample task_index (radio specialist). None keeps dataset ids.
     force_task_index: int | None = None
+    # Build CFGRL rewind negatives (o=0) inside the dataset.
+    cfgrl_rewind: bool = False
 
 
 class GroupFactory(Protocol):
@@ -181,6 +183,8 @@ class LeRobotB1KDataConfig(DataConfigFactory):
             "episode_length": "episode_length",
             "index": "index",           # Preserve index
         }
+        if self.base_config is not None and self.base_config.cfgrl_rewind:
+            repack_mapping["optimality"] = "optimality"
             
         repack_transform = _transforms.Group(
             inputs=[_transforms.RepackTransform(repack_mapping)]
@@ -352,6 +356,16 @@ def _2026_challenge_task_names() -> list[str]:
     return [rec["task_name"] for rec in records]
 
 
+# Checkpoint 3 from the 2025 solution (task_checkpoint_mapping.json).
+# Ids: 4, 27, 31, 32, 33, 35, 36, 37, 38, 39, 41, 46, 49.
+_CHECKPOINT3_TASK_IDS = (4, 27, 31, 32, 33, 35, 36, 37, 38, 39, 41, 46, 49)
+
+
+def _checkpoint3_task_names() -> list[str]:
+    names = _2026_challenge_task_names()
+    return [names[task_id] for task_id in _CHECKPOINT3_TASK_IDS]
+
+
 def get_data_factories(config: "TrainConfig") -> list[DataConfigFactory]:
     data = config.data
     if isinstance(data, (list, tuple)):
@@ -489,6 +503,176 @@ _CONFIGS = [
         fsdp_devices=8,
         save_interval=5_000,
         keep_period=50_000,
+        log_interval=25,
+    ),
+    # 2025 checkpoint-3 subset (13 tasks), finetuned from the 100-task generalist.
+    # 60% 2026 demos + 40% Comet RFT. Task ids stay the global 2026 indices so
+    # the frozen task embeddings and stage table still line up. Comet has no
+    # trajectories for can_meat, clean_a_patio, or make_pizza.
+    TrainConfig(
+        name="pi_behavior_2026_ckpt3_13tasks_demo0_6_comet0_4",
+        exp_name="openpi",
+        project_name="B1K",
+        model=pi_behavior_config.PiBehaviorConfig(
+            action_horizon=30,
+            action_dim=32,
+            use_correlated_noise=True,
+            correlation_beta=0.5,
+            use_fast_auxiliary=True,
+            fast_loss_weight=0.05,
+            fast_encoded_dims="0:6,7:23",
+            fast_vocab_size=1024,
+            max_fast_tokens=200,
+            use_kv_transform=True,
+            use_knowledge_insulation=False,
+            subtask_loss_weight=0.1,
+            freeze_vision_backbone=True,
+            num_tasks=100,
+        ),
+        sample_weights=[0.6, 0.4],
+        data=[
+            LeRobotB1KDataConfig(
+                repo_id="behavior-1k/2026-challenge-demos",
+                assets=AssetsConfig(
+                    assets_dir="./outputs/assets/pi_behavior_2026_all100_demo0_6_comet0_4",
+                    asset_id="behavior-1k/2026-challenge-demos",
+                ),
+                base_config=DataConfig(
+                    prompt_from_task=False,
+                    behavior_dataset_root=_behavior_dataset_root("2026-challenge-demos"),
+                    use_per_timestamp_norm=True,
+                    tasks=_checkpoint3_task_names(),
+                    episodes_index=list(range(200)),
+                    tolerance_s=1.0 / 30.0,
+                ),
+                use_delta_joint_actions=True,
+                use_fast_tokenization=True,
+            ),
+            LeRobotB1KDataConfig(
+                repo_id="delinqu/comet-1.5k",
+                assets=AssetsConfig(
+                    assets_dir="./outputs/assets/pi_behavior_2026_all100_demo0_6_comet0_4",
+                    asset_id="behavior-1k/2026-challenge-demos",
+                ),
+                base_config=DataConfig(
+                    prompt_from_task=False,
+                    behavior_dataset_root=_behavior_dataset_root("comet-1.5k"),
+                    use_per_timestamp_norm=True,
+                    tasks=_checkpoint3_task_names(),
+                    align_legacy_rft_to_2026=True,
+                    tolerance_s=1.0 / 30.0,
+                ),
+                use_delta_joint_actions=True,
+                use_fast_tokenization=True,
+            ),
+        ],
+        freeze_filter=pi_behavior_config.PiBehaviorConfig(num_tasks=100).get_task_and_system2_freeze_filter(),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=500,
+            peak_lr=2.5e-5,
+            decay_steps=30_000,
+            decay_lr=2.5e-6,
+        ),
+        num_flow_samples=15,
+        weight_loader=weight_loaders.PiBehaviorWeightLoader(
+            "/workspace-SR008.nfs2/datasets/staroverov_b1k/behavior/b1k_solution/"
+            "pi_behavior_2026_all100_demo0_6_comet0_4/"
+            "pi_behavior_2026_all100_bs256_w80_20260919_004055/100000/params"
+        ),
+        num_train_steps=2_000_000,
+        assets_base_dir="./outputs/assets",
+        checkpoint_base_dir="/workspace-SR008.nfs2/datasets/staroverov_b1k/behavior/b1k_solution",
+        num_workers=80,
+        batch_size=1024,
+        fsdp_devices=8,
+        save_interval=5_000,
+        keep_period=50_000,
+        log_interval=25,
+    ),
+    # CFGRL finetune of the 13-task checkpoint. Forward actions are o=1, true
+    # rewinds are o=0, and 10% of examples drop the bit. No Robometer metadata.
+    TrainConfig(
+        name="pi_behavior_2026_ckpt3_13tasks_cfgrl_rewind",
+        exp_name="openpi",
+        project_name="B1K",
+        model=pi_behavior_config.PiBehaviorConfig(
+            action_horizon=30,
+            action_dim=32,
+            use_correlated_noise=True,
+            correlation_beta=0.5,
+            use_fast_auxiliary=True,
+            fast_loss_weight=0.05,
+            fast_encoded_dims="0:6,7:23",
+            fast_vocab_size=1024,
+            max_fast_tokens=200,
+            use_kv_transform=True,
+            use_knowledge_insulation=False,
+            subtask_loss_weight=0.1,
+            freeze_vision_backbone=True,
+            num_tasks=100,
+            use_optimality=True,
+            cfg_guidance_weight=1.5,
+        ),
+        sample_weights=[0.6, 0.4],
+        data=[
+            LeRobotB1KDataConfig(
+                repo_id="behavior-1k/2026-challenge-demos",
+                assets=AssetsConfig(
+                    assets_dir="./outputs/assets/pi_behavior_2026_all100_demo0_6_comet0_4",
+                    asset_id="behavior-1k/2026-challenge-demos",
+                ),
+                base_config=DataConfig(
+                    prompt_from_task=False,
+                    behavior_dataset_root=_behavior_dataset_root("2026-challenge-demos"),
+                    use_per_timestamp_norm=True,
+                    tasks=_checkpoint3_task_names(),
+                    episodes_index=list(range(200)),
+                    tolerance_s=1.0 / 30.0,
+                    cfgrl_rewind=True,
+                ),
+                use_delta_joint_actions=True,
+                use_fast_tokenization=True,
+            ),
+            LeRobotB1KDataConfig(
+                repo_id="delinqu/comet-1.5k",
+                assets=AssetsConfig(
+                    assets_dir="./outputs/assets/pi_behavior_2026_all100_demo0_6_comet0_4",
+                    asset_id="behavior-1k/2026-challenge-demos",
+                ),
+                base_config=DataConfig(
+                    prompt_from_task=False,
+                    behavior_dataset_root=_behavior_dataset_root("comet-1.5k"),
+                    use_per_timestamp_norm=True,
+                    tasks=_checkpoint3_task_names(),
+                    align_legacy_rft_to_2026=True,
+                    tolerance_s=1.0 / 30.0,
+                    cfgrl_rewind=True,
+                ),
+                use_delta_joint_actions=True,
+                use_fast_tokenization=True,
+            ),
+        ],
+        freeze_filter=pi_behavior_config.PiBehaviorConfig(num_tasks=100).get_task_and_system2_freeze_filter(),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=200,
+            peak_lr=2.5e-5,
+            decay_steps=20_000,
+            decay_lr=2.5e-6,
+        ),
+        num_flow_samples=15,
+        weight_loader=weight_loaders.PiBehaviorWeightLoader(
+            "/workspace-SR008.nfs2/datasets/staroverov_b1k/behavior/b1k_solution/"
+            "pi_behavior_2026_ckpt3_13tasks_demo0_6_comet0_4/"
+            "pi_behavior_2026_ckpt3_13tasks_20260924_232445/20000/params"
+        ),
+        num_train_steps=20_000,
+        assets_base_dir="./outputs/assets",
+        checkpoint_base_dir="/workspace-SR008.nfs2/datasets/staroverov_b1k/behavior/b1k_solution",
+        num_workers=64,
+        batch_size=512,
+        fsdp_devices=4,
+        save_interval=2_000,
+        keep_period=10_000,
         log_interval=25,
     ),
     # 2026 100-task generalist: trains task embeddings + System-2 stages on all

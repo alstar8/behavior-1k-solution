@@ -180,6 +180,16 @@ class PiBehavior(_model.BaseModel):
         self.time_mlp_in = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
         self.time_mlp_out = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
         self.action_out_proj = nnx.Linear(action_expert_config.width, config.action_dim, rngs=rngs)
+        # 0 = unconditional, 1 = rewind, 2 = forward. Zeros so a fresh finetune matches the loaded policy.
+        if config.use_optimality:
+            self.optimality_embed = nnx.Embed(
+                num_embeddings=3,
+                features=action_expert_config.width,
+                embedding_init=jax.nn.initializers.zeros,
+                rngs=rngs,
+            )
+        else:
+            self.optimality_embed = None
 
         # Correlated noise generation
         # Initialize as NNX Intermediate (excluded from checkpoints, loaded from norm_stats)
@@ -660,6 +670,13 @@ class PiBehavior(_model.BaseModel):
         time_emb = nnx.swish(time_emb)
         action_expert_tokens = action_tokens
         adarms_cond = time_emb
+        if self.optimality_embed is not None:
+            if obs.optimality is None:
+                opt_ids = jnp.zeros((noisy_actions.shape[0],), dtype=jnp.int32)
+            else:
+                opt_ids = obs.optimality.astype(jnp.int32)
+            opt_emb = self.optimality_embed(opt_ids).astype(adarms_cond.dtype)
+            adarms_cond = adarms_cond + opt_emb
         
         tokens.append(action_expert_tokens)
         input_mask.append(jnp.ones(action_expert_tokens.shape[:2], dtype=jnp.bool_))
@@ -899,6 +916,11 @@ class PiBehavior(_model.BaseModel):
         
         # 13. Total loss
         losses["total_loss"] = losses["action_loss"] + subtask_loss_value + fast_loss_value
+        if observation.optimality is not None:
+            opt = observation.optimality.astype(jnp.float32)
+            losses["optimality_rewind"] = jnp.mean(opt == 1)
+            losses["optimality_forward"] = jnp.mean(opt == 2)
+            losses["optimality_dropout"] = jnp.mean(opt == 0)
         
         return losses
 
@@ -1031,29 +1053,35 @@ class PiBehavior(_model.BaseModel):
             # Use config value for time threshold
             TIME_THRESHOLD_INPAINT = self.config.time_threshold_inpaint
             
-            # Model forward pass
-            suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(
-                observation, x_t, jnp.broadcast_to(time, batch_size)
-            )
-            suffix_attn_mask = make_attn_mask(suffix_mask, suffix_ar_mask)
-            prefix_attn_mask = einops.repeat(prefix_mask, "b p -> b s p", s=suffix_tokens.shape[1])
-            full_attn_mask = jnp.concatenate([prefix_attn_mask, suffix_attn_mask], axis=-1)
-            assert full_attn_mask.shape == (
-                batch_size,
-                suffix_tokens.shape[1],
-                prefix_tokens.shape[1] + suffix_tokens.shape[1],
-            )
-            positions = jnp.sum(prefix_mask, axis=-1)[:, None] + jnp.cumsum(suffix_mask, axis=-1) - 1
+            def velocity_for(opt_id):
+                opt_obs = observation
+                if self.optimality_embed is not None:
+                    opt_obs = observation.replace(
+                        optimality=jnp.full((batch_size,), opt_id, dtype=jnp.int32)
+                    )
+                suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(
+                    opt_obs, x_t, jnp.broadcast_to(time, batch_size)
+                )
+                suffix_attn_mask = make_attn_mask(suffix_mask, suffix_ar_mask)
+                prefix_attn_mask = einops.repeat(prefix_mask, "b p -> b s p", s=suffix_tokens.shape[1])
+                full_attn_mask = jnp.concatenate([prefix_attn_mask, suffix_attn_mask], axis=-1)
+                positions = jnp.sum(prefix_mask, axis=-1)[:, None] + jnp.cumsum(suffix_mask, axis=-1) - 1
+                (_, suffix_out), _ = self.PaliGemma.llm(
+                    [None, suffix_tokens],
+                    mask=full_attn_mask,
+                    positions=positions,
+                    kv_cache=kv_cache,
+                    adarms_cond=[None, adarms_cond],
+                )
+                return self.action_out_proj(suffix_out[:, -self.action_horizon :])
 
-            (prefix_out, suffix_out), _ = self.PaliGemma.llm(
-                [None, suffix_tokens],
-                mask=full_attn_mask,
-                positions=positions,
-                kv_cache=kv_cache,
-                adarms_cond=[None, adarms_cond],
-            )
-            assert prefix_out is None
-            v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
+            if self.optimality_embed is not None and self.config.cfg_guidance_weight != 1.0:
+                v_null = velocity_for(0)
+                v_forward = velocity_for(2)
+                weight = self.config.cfg_guidance_weight
+                v_t = v_null + weight * (v_forward - v_null)
+            else:
+                v_t = velocity_for(2 if self.optimality_embed is not None else 0)
             
             # Euler step: x_{t+dt} = x_t + dt * v_t
             x_t_new = x_t + dt * v_t

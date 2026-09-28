@@ -81,6 +81,7 @@ def create_behavior_dataset(data_config: _config.DataConfig, action_horizon: int
         tolerance_s=getattr(data_config, "tolerance_s", 1.0 / 30.0),
         check_timestamp_sync=False,
         fine_grained_level=0,
+        cfgrl_rewind=bool(getattr(data_config, "cfgrl_rewind", False)),
     )
 
     pre_transforms = []

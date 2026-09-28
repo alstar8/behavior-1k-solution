@@ -266,7 +266,8 @@ def train_step(
                 "action_out_proj",
                 "time_mlp_in",
                 "time_mlp_out",
-                "kv_transform"
+                "kv_transform",
+                "optimality_embed",
             ])
         
         def is_vlm_param(path_str):
@@ -439,7 +440,7 @@ def main(config: _config.TrainConfig):
             
             # Create a concise console log with main metrics
             main_metrics = {k: v for k, v in reduced_info.items() 
-                          if "loss" in k or "accuracy" in k or k in ["grad_norm", "param_norm", "grad_norm_vlm", "grad_norm_action_expert"]}
+                          if "loss" in k or "accuracy" in k or "optimality" in k or k in ["grad_norm", "param_norm", "grad_norm_vlm", "grad_norm_action_expert"]}
             parts = []
             for k, v in main_metrics.items():
                 try:

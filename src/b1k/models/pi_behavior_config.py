@@ -115,6 +115,11 @@ class PiBehaviorConfig(_model.BaseModelConfig):
     # Vision backbone finetuning control
     freeze_vision_backbone: bool = True
 
+    # CFGRL optimality token added to the action expert (0 = dropout, 1 = rewind, 2 = forward).
+    use_optimality: bool = False
+    # Test-time guidance: v = v_null + w * (v_forward - v_null). w=1 is the forward-conditioned policy.
+    cfg_guidance_weight: float = 1.0
+
     def get_task_and_system2_freeze_filter(self) -> nnx.filterlib.Filter:
         """Freeze task embeddings and System-2 stage modules during specialist finetuning."""
         from openpi.shared import nnx_utils
@@ -185,6 +190,8 @@ class PiBehaviorConfig(_model.BaseModelConfig):
             if self.use_fast_auxiliary:
                 obs_kwargs["fast_tokens"] = jax.ShapeDtypeStruct([batch_size, self.max_fast_tokens], jnp.int32)
                 obs_kwargs["fast_token_mask"] = jax.ShapeDtypeStruct([batch_size, self.max_fast_tokens], bool)
+            if self.use_optimality:
+                obs_kwargs["optimality"] = jax.ShapeDtypeStruct([batch_size], jnp.int32)
             
             observation_spec = Observation(**obs_kwargs)
         

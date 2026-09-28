@@ -21,6 +21,15 @@ from openpi.shared import array_typing as at
 
 ArrayT = TypeVar("ArrayT", bound=jax.Array | torch.Tensor | np.ndarray)
 
+def _as_optimality(value: ArrayT | None) -> ArrayT | None:
+    if value is None:
+        return None
+    if isinstance(value, torch.Tensor):
+        value = value.detach().cpu().numpy()
+    array = np.asarray(value, dtype=np.int32)
+    return np.squeeze(array)
+
+
 IMAGE_KEYS = (
     "base_0_rgb",
     "left_wrist_0_rgb",
@@ -44,6 +53,8 @@ class Observation(Generic[ArrayT]):
     
     fast_tokens: at.Int[ArrayT, "*b t"] | None = None
     fast_token_mask: at.Bool[ArrayT, "*b t"] | None = None
+    # CFGRL label: 0 = dropped, 1 = rewind, 2 = forward success.
+    optimality: at.Int[ArrayT, "*b"] | None = None
 
     @classmethod
     def from_dict(cls, data: at.PyTree[ArrayT]) -> "Observation[ArrayT]":
@@ -68,6 +79,7 @@ class Observation(Generic[ArrayT]):
             token_loss_mask=data.get("token_loss_mask"),
             fast_tokens=data.get("fast_tokens"),
             fast_token_mask=data.get("fast_token_mask"),
+            optimality=_as_optimality(data.get("optimality")),
         )
 
     def to_dict(self) -> at.PyTree[ArrayT]:
@@ -139,5 +151,6 @@ def preprocess_observation(
         token_loss_mask=observation.token_loss_mask,
         fast_tokens=getattr(observation, 'fast_tokens', None),
         fast_token_mask=getattr(observation, 'fast_token_mask', None),
+        optimality=observation.optimality,
     )
 

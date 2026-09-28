@@ -8,6 +8,7 @@ import logging
 import re
 
 import flax.traverse_util
+import jax
 import numpy as np
 import orbax.checkpoint as ocp
 
@@ -37,12 +38,23 @@ class PiBehaviorWeightLoader(WeightLoader):
     params_path: str
 
     def load(self, params: at.Params) -> at.Params:
-        # Load checkpoint
+        # Load checkpoint. Saved shardings may come from a different device count,
+        # so restore every array onto the devices that are available now.
         params_path = download.maybe_download(self.params_path)
-        
-        # Load directly with PyTreeCheckpointer (handles both old and new checkpoint formats)
+        mesh = jax.sharding.Mesh(jax.devices(), ("x",))
+        sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
         with ocp.PyTreeCheckpointer() as ckptr:
-            restored = ckptr.restore(params_path)
+            metadata = ckptr.metadata(params_path)
+            restored = ckptr.restore(
+                params_path,
+                ocp.args.PyTreeRestore(
+                    item=metadata,
+                    restore_args=jax.tree.map(
+                        lambda _: ocp.ArrayRestoreArgs(sharding=sharding, restore_type=np.ndarray),
+                        metadata,
+                    ),
+                ),
+            )
         
         # Handle nested 'params' key (from some checkpoint formats)
         if isinstance(restored, dict) and "params" in restored:
@@ -60,10 +72,10 @@ class PiBehaviorWeightLoader(WeightLoader):
         has_task_embeddings = 'task_embeddings' in loaded_params
         
         if has_task_embeddings:
-            # Loading PI_BEHAVIOR checkpoint - load ALL weights from checkpoint
+            # Loading PI_BEHAVIOR checkpoint - load ALL weights from checkpoint.
+            # optimality_embed is new for CFGRL and stays at its zero init.
             logging.info("Loading PI_BEHAVIOR checkpoint (all weights will be loaded)")
-            # Use _merge_params with empty missing_regex to validate shapes
-            return _merge_params(loaded_params, params, missing_regex="^$")
+            return _merge_params(loaded_params, params, missing_regex=".*optimality_embed.*")
         else:
             # Loading Pi05 checkpoint - preserve new PI_BEHAVIOR-specific parameters
             logging.info("Loading Pi05 checkpoint (new PI_BEHAVIOR parameters will use random init)")

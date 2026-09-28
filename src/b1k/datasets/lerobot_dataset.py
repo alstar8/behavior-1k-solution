@@ -38,6 +38,12 @@ import packaging.version
 import torch as th
 from torch.utils.data import Dataset
 from torch.utils.data import get_worker_info
+
+from b1k.cfgrl import OPT_DROPOUT
+from b1k.cfgrl import OPT_FORWARD
+from b1k.cfgrl import OPT_REWIND
+from b1k.cfgrl import rewind_absolute_actions
+from b1k.cfgrl import state_from_proprio
 import torchvision
 
 try:
@@ -279,6 +285,9 @@ class BehaviorLeRobotDataset(LeRobotDataset):
         train_rgb_type: str = "regular",  # regular | bbox | point
         return_seg_instance: bool = False,
         skill_list: list[str] = ["all"],
+        cfgrl_rewind: bool = False,
+        cfgrl_rewind_prob: float = 0.5,
+        cfgrl_dropout_prob: float = 0.1,
     ):
         """
         Custom args:
@@ -323,6 +332,9 @@ class BehaviorLeRobotDataset(LeRobotDataset):
         self.return_seg_instance = return_seg_instance
         self.train_rgb_type = train_rgb_type
         self.skill_list = skill_list
+        self.cfgrl_rewind = cfgrl_rewind
+        self.cfgrl_rewind_prob = cfgrl_rewind_prob
+        self.cfgrl_dropout_prob = cfgrl_dropout_prob
 
         # Unused attributes
         self.image_writer = None
@@ -602,7 +614,10 @@ class BehaviorLeRobotDataset(LeRobotDataset):
                 try:
                     item = super().__getitem__(candidate_idx)
                     item["task"] = self._get_fine_grained_task(item)
-                    return self._alias_v3_rgb_keys(item)
+                    item = self._alias_v3_rgb_keys(item)
+                    if self.cfgrl_rewind:
+                        item = self._apply_cfgrl_rewind(item, candidate_idx)
+                    return item
                 except AssertionError as exc:
                     if not _is_video_tolerance_error(exc):
                         raise
@@ -733,6 +748,43 @@ class BehaviorLeRobotDataset(LeRobotDataset):
         self.current_streaming_frame_idx += 1
 
         return self._alias_v3_rgb_keys(item)
+
+    def _apply_cfgrl_rewind(self, item: dict, index: int) -> dict:
+        """Label some samples with the action chunk that undoes the previous chunk.
+
+        The current frame stays the observation. Past actions are read from the dataset
+        table, reversed, and tagged optimality 1. Forward samples stay optimality 2.
+        Ten percent of examples drop the label to 0.
+        """
+        label = OPT_FORWARD
+        actions = item.get("action")
+        horizon = int(actions.shape[0]) if actions is not None else 0
+        past_index = index - (horizon - 1)
+        episode_index = int(item["episode_index"])
+        ep_pos = int(self.episode_data_index_pos[episode_index])
+        ep_start = int(self.episode_data_index["from"][ep_pos])
+        can_rewind = horizon > 1 and past_index >= ep_start
+        if can_rewind and random.random() < self.cfgrl_rewind_prob:
+            try:
+                past = self.hf_dataset[past_index : index + 1]
+                past_actions = np.asarray(past["action"], dtype=np.float32)
+                if past_actions.shape[0] != horizon:
+                    raise RuntimeError(f"past action window {past_actions.shape} != {horizon}")
+                start_state = state_from_proprio(np.asarray(past["observation.state"])[0])
+                item = dict(item)
+                item["action"] = th.as_tensor(
+                    rewind_absolute_actions(past_actions, start_state),
+                    dtype=th.float32,
+                )
+                label = OPT_REWIND
+            except Exception as exc:
+                logger.warning("CFGRL rewind fell back to the forward action: %s", exc)
+                label = OPT_FORWARD
+        if random.random() < self.cfgrl_dropout_prob:
+            label = OPT_DROPOUT
+        item = dict(item)
+        item["optimality"] = np.int32(label)
+        return item
 
     def _get_current_task_skill(self, item: dict) -> str:
         ep_idx = item["episode_index"].item()
