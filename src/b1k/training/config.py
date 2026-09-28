@@ -420,6 +420,56 @@ _CONFIGS = [
         save_interval=500,
         keep_period=2000,
     ),
+    # 2025 challenge submission checkpoints (IliaLarchenko/behavior_submission).
+    # Same training recipe as pi_behavior_b1k_fast, but the embedding tables match
+    # the 50-task 2025 stage counts. Actions are still the 23-d BEHAVIOR layout;
+    # convert_2025_action_to_2026 is applied only when serving these weights.
+    TrainConfig(
+        name="pi_behavior_2025_submission",
+        exp_name="openpi",
+        project_name="B1K",
+        model=pi_behavior_config.PiBehaviorConfig(
+            action_horizon=30,
+            action_dim=32,
+            num_tasks=50,
+            task_num_stages=pi_behavior_config.TASK_NUM_STAGES_2025,
+            use_correlated_noise=True,
+            correlation_beta=0.5,
+            use_fast_auxiliary=True,
+            fast_loss_weight=0.05,
+            fast_encoded_dims="0:6,7:23",
+            fast_vocab_size=1024,
+            max_fast_tokens=200,
+            use_kv_transform=True,
+            use_knowledge_insulation=False,
+            subtask_loss_weight=0.1,
+            freeze_vision_backbone=True,
+        ),
+        data=LeRobotB1KDataConfig(
+            repo_id="IliaLarchenko/behavior_224_rgb",
+            base_config=DataConfig(
+                prompt_from_task=False,
+                behavior_dataset_root="~/data/behavior_224_rgb",
+                use_per_timestamp_norm=True,
+            ),
+            use_delta_joint_actions=True,
+            use_fast_tokenization=True,
+        ),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1000,
+            peak_lr=1e-4,
+            decay_steps=20_000,
+            decay_lr=1e-5,
+        ),
+        num_flow_samples=15,
+        weight_loader=weight_loaders.PiBehaviorWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=200_000,
+        assets_base_dir="./outputs/assets",
+        checkpoint_base_dir="./outputs/checkpoints",
+        num_workers=80,
+        save_interval=500,
+        keep_period=2000,
+    ),
     # 2026 turning_on_radio specialist: all 200 challenge demos + all Comet RFT
     # radio trajectories (60/40 mix). Task embeddings and System 2 stay frozen
     # at the 100-task generalist; norm stats / FAST match that pretrain.

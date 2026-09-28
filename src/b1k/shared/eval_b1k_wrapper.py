@@ -11,9 +11,18 @@ from openpi_client.image_tools import resize_with_pad
 from b1k.policies.b1k_policy import extract_state_from_proprio
 from b1k.models.pi_behavior_config import TASK_NUM_STAGES
 from b1k.shared.correction_rules import apply_correction_rules, check_gripper_variation
+from b1k.shared.convert_2025_action import convert_2025_action_to_2026
 logger = logging.getLogger(__name__)
 
 RESIZE_SIZE = 224
+
+
+def _drop_leading_env_batch(value: np.ndarray, *, unbatched_ndim: int) -> np.ndarray:
+    """Drop the env axis added by batched OmniGibson eval when num_envs is 1."""
+    array = np.asarray(value)
+    if array.ndim == unbatched_ndim + 1:
+        return array[0]
+    return array
 
 
 @dataclasses.dataclass
@@ -27,6 +36,10 @@ class B1KWrapperConfig:
     time_threshold_inpaint: float = 0.3
     num_steps: int = 20
     apply_eval_tricks: bool = True
+    use_gt_stage: bool = False
+    gt_episode_length: int = 1956
+    # 2025 submission checkpoints only. 2026 weights already emit the eval action.
+    convert_2025_actions: bool = False
 
 
 class B1KPolicyWrapper():
@@ -102,11 +115,17 @@ class B1KPolicyWrapper():
 
     def process_obs(self, obs: dict) -> dict:
         """Process observation to match model input format."""
-        prop_state = obs["robot_r1::proprio"]
+        prop_state = _drop_leading_env_batch(obs["robot_r1::proprio"], unbatched_ndim=1)
         
-        head_original = obs["robot_r1::robot_r1:zed_link:Camera:0::rgb"][..., :3]
-        left_original = obs["robot_r1::robot_r1:left_realsense_link:Camera:0::rgb"][..., :3]
-        right_original = obs["robot_r1::robot_r1:right_realsense_link:Camera:0::rgb"][..., :3]
+        head_original = _drop_leading_env_batch(
+            obs["robot_r1::robot_r1:zed_link:Camera:0::rgb"][..., :3], unbatched_ndim=3
+        )
+        left_original = _drop_leading_env_batch(
+            obs["robot_r1::robot_r1:left_realsense_link:Camera:0::rgb"][..., :3], unbatched_ndim=3
+        )
+        right_original = _drop_leading_env_batch(
+            obs["robot_r1::robot_r1:right_realsense_link:Camera:0::rgb"][..., :3], unbatched_ndim=3
+        )
         
         # Resize images
         head_resized = resize_with_pad(head_original, RESIZE_SIZE, RESIZE_SIZE)
@@ -121,6 +140,16 @@ class B1KPolicyWrapper():
             "prompt": self.text_prompt,
         }
     
+    def _gt_stage(self) -> int:
+        """Time-split stage used as the training label, indexed by control step."""
+        task_id = self.task_id if self.task_id is not None else 0
+        num_stages = TASK_NUM_STAGES[task_id]
+        frames_per_stage = self.config.gt_episode_length / num_stages
+        if frames_per_stage <= 0:
+            return 0
+        stage = int(self.step_count / frames_per_stage)
+        return max(0, min(stage, num_stages - 1))
+
     def update_current_stage(self, predicted_subtask_logits):
         """Update current stage using majority voting."""
         if self.task_id is None:
@@ -193,7 +222,7 @@ class B1KPolicyWrapper():
             new_task_id = int(obs["task_id"][0])
             self._handle_task_change(new_task_id)
         
-        raw_state = obs["robot_r1::proprio"]
+        raw_state = _drop_leading_env_batch(obs["robot_r1::proprio"], unbatched_ndim=1)
         current_state = extract_state_from_proprio(raw_state)
         
         # Check if we need new actions
@@ -201,6 +230,8 @@ class B1KPolicyWrapper():
             
             # Process observation
             model_input = self.process_obs(obs)
+            if self.config.use_gt_stage:
+                self.current_stage = self._gt_stage()
             model_input = self.prepare_batch_for_pi_behavior(model_input)
             
             # Add rolling inpainting if available
@@ -220,6 +251,8 @@ class B1KPolicyWrapper():
                 actions = actions[0]
             if actions.shape[1] > 23:
                 actions = actions[:, :23]
+            if self.config.convert_2025_actions:
+                actions = convert_2025_action_to_2026(actions)
             
             # Apply eval tricks if enabled
             should_compress = self.config.execute_in_n_steps < self.config.actions_to_execute
@@ -254,14 +287,16 @@ class B1KPolicyWrapper():
             actions_to_execute = self.config.actions_to_execute if should_compress else self.config.execute_in_n_steps
             execute_steps = self.config.execute_in_n_steps
             
-            # Save actions for next inpainting (before compression)
-            inpainting_start = actions_to_execute
-            inpainting_end = inpainting_start + self.config.actions_to_keep
-            
-            if len(actions) >= inpainting_end:
-                self.next_initial_actions = actions[inpainting_start:inpainting_end].copy()
-            else:
+            # A previous chunk's tail is pinned onto the next plan. Keep 0 disables that.
+            if self.config.actions_to_keep <= 0:
                 self.next_initial_actions = None
+            else:
+                inpainting_start = actions_to_execute
+                inpainting_end = inpainting_start + self.config.actions_to_keep
+                if len(actions) >= inpainting_end:
+                    self.next_initial_actions = actions[inpainting_start:inpainting_end].copy()
+                else:
+                    self.next_initial_actions = None
             
             # Extract and compress actions
             self.last_actions = actions[:actions_to_execute].copy()
@@ -280,8 +315,10 @@ class B1KPolicyWrapper():
                 compression_status = f"compressed {actions_to_execute}→{execute_steps}" if should_compress else f"uncompressed ({execute_steps})"
                 logger.info(f"🎯 Prediction #{self.prediction_count} | Actions: {compression_status} | Inpainting: {self.next_initial_actions is not None}")
             
-            # Update stage based on model predictions
-            if "subtask_logits" in output:
+            # Update stage based on model predictions. GT mode keeps the time-split label.
+            if self.config.use_gt_stage:
+                self.current_stage = self._gt_stage()
+            elif "subtask_logits" in output:
                 self.update_current_stage(output["subtask_logits"])
         
         # Get current action from sequence

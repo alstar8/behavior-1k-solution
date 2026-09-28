@@ -22,12 +22,7 @@ from openpi.shared import array_typing as at
 # Import from our custom modules
 from b1k.models import pi_behavior_config
 from b1k.models.observation import Observation, preprocess_observation
-from b1k.models.pi_behavior_config import (
-    TASK_NUM_STAGES, 
-    MAX_NUM_STAGES, 
-    TOTAL_TASK_STAGE_EMBEDDINGS, 
-    TASK_STAGE_OFFSETS
-)
+from b1k.models.pi_behavior_config import MAX_NUM_STAGES
 
 logger = logging.getLogger("b1k")
 
@@ -96,6 +91,10 @@ class PiBehavior(_model.BaseModel):
         
         # Store config for later use
         self.config = config
+        stages = config.resolved_task_num_stages()
+        self._task_num_stages = stages
+        self._task_stage_offsets = tuple(sum(stages[:i]) for i in range(len(stages)))
+        self._num_task_stage_embeddings = sum(stages)
         
         paligemma_config = _gemma.get_config(config.paligemma_variant)
         action_expert_config = _gemma.get_config(config.action_expert_variant)
@@ -154,7 +153,7 @@ class PiBehavior(_model.BaseModel):
         # Task-specific stage embeddings (one per stage per task)
         # Total embeddings = sum of stages across all tasks (1087 for 2026 100-task set)
         self.task_stage_embeddings = nnx.Embed(
-            num_embeddings=TOTAL_TASK_STAGE_EMBEDDINGS,
+            num_embeddings=self._num_task_stage_embeddings,
             features=self.subtask_encoding_dim,
             rngs=rngs,
         )
@@ -245,7 +244,7 @@ class PiBehavior(_model.BaseModel):
         """
         # Get number of stages for each task in batch using JAX array indexing
         # Convert tuple to JAX array inside function to avoid import-time device allocation
-        task_num_stages_array = jnp.array(TASK_NUM_STAGES, dtype=jnp.int32)
+        task_num_stages_array = jnp.array(self._task_num_stages, dtype=jnp.int32)
         task_num_stages = task_num_stages_array[task_ids]  # [B] - JAX array indexing
         
         # Normalize: stage 0 → 0.0, last stage → 1.0 (per-task scaling)
@@ -486,7 +485,7 @@ class PiBehavior(_model.BaseModel):
         # Task-specific stage embedding with corrected indexing
         # Use vectorized lookup: offset + stage for each task
         # Convert tuple to JAX array inside function to avoid import-time device allocation
-        task_stage_offsets_array = jnp.array(TASK_STAGE_OFFSETS, dtype=jnp.int32)
+        task_stage_offsets_array = jnp.array(self._task_stage_offsets, dtype=jnp.int32)
         task_stage_offsets = task_stage_offsets_array[task_ids]  # [b] - JAX array indexing
         task_stage_idx = task_stage_offsets + subtask_state  # [b]
         task_stage_embedding = self.task_stage_embeddings(task_stage_idx)  # [b, 1024]
@@ -741,7 +740,7 @@ class PiBehavior(_model.BaseModel):
         
         # Mask out invalid stages for each task (vectorized JAX operations)
         task_ids = observation.tokenized_prompt[:, 0]  # [B]
-        task_num_stages_array = jnp.array(TASK_NUM_STAGES, dtype=jnp.int32)
+        task_num_stages_array = jnp.array(self._task_num_stages, dtype=jnp.int32)
         task_num_stages = task_num_stages_array[task_ids]  # [B] - JAX array indexing
         stage_range = jnp.arange(MAX_NUM_STAGES)  # [15]
         valid_mask = stage_range[None, :] < task_num_stages[:, None]  # [B, 15]
@@ -1037,7 +1036,7 @@ class PiBehavior(_model.BaseModel):
         
         # Mask out invalid stages for each task (vectorized JAX operations)
         task_ids = observation.tokenized_prompt[:, 0]  # [B]
-        task_num_stages_array = jnp.array(TASK_NUM_STAGES, dtype=jnp.int32)
+        task_num_stages_array = jnp.array(self._task_num_stages, dtype=jnp.int32)
         task_num_stages = task_num_stages_array[task_ids]  # [B] - JAX array indexing
         stage_range = jnp.arange(MAX_NUM_STAGES)  # [15]
         valid_mask = stage_range[None, :] < task_num_stages[:, None]  # [B, 15]

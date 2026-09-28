@@ -39,6 +39,16 @@ TASK_NUM_STAGES = (
     5, 11, 5, 5, 15, 15, 5, 15, 15, 9,  # 90-99
 )
 
+# 2025 challenge (50 tasks). Stage counts differ from the 2026 table, so the
+# 2025 submission checkpoints need this tuple or task_stage_embeddings will not load.
+TASK_NUM_STAGES_2025 = (
+    5, 6, 15, 15, 14, 12, 9, 15, 10, 15,  # 0-9
+    7, 13, 10, 15, 15, 15, 15, 11, 13, 12,  # 10-19
+    14, 15, 9, 15, 15, 15, 15, 15, 15, 15,  # 20-29
+    11, 10, 10, 13, 5, 5, 14, 6, 8, 10,  # 30-39
+    5, 15, 8, 15, 12, 11, 9, 14, 15, 15,  # 40-49
+)
+
 MAX_NUM_STAGES = 15  # Maximum stages per task
 TOTAL_TASK_STAGE_EMBEDDINGS = sum(TASK_NUM_STAGES)  # 1087 for 2026 100-task set
 
@@ -59,6 +69,8 @@ class PiBehaviorConfig(_model.BaseModelConfig):
     
     # Number of tasks in the behavior dataset
     num_tasks: int = 100
+    # Per-task stage counts. None uses the 2026 TASK_NUM_STAGES table.
+    task_num_stages: tuple[int, ...] | None = None
     # Task embedding dimension - will match the paligemma width
     task_embedding_dim: int = None  # type: ignore
     # Maximum number of subtask states across all tasks
@@ -134,6 +146,11 @@ class PiBehaviorConfig(_model.BaseModelConfig):
             nnx_utils.PathRegex(".*fusion_layer.*"),
             nnx_utils.PathRegex(".*stage_projection.*"),
         )
+
+    def resolved_task_num_stages(self) -> tuple[int, ...]:
+        if self.task_num_stages is not None:
+            return tuple(self.task_num_stages)
+        return TASK_NUM_STAGES
 
     def __post_init__(self):
         if self.task_embedding_dim is None:
