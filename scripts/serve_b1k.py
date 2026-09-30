@@ -78,6 +78,9 @@ class Args:
     time_threshold_inpaint: float = 0.3
     num_steps: int = 20
     apply_eval_tricks: bool = True  # Enable correction rules and gripper variation checks
+    use_gt_stage: bool = False  # Prompt with the demo time-split stage instead of the voter
+    gt_episode_length: int = 1956
+    convert_2025_actions: bool = False
     
     # Multi-checkpoint support for PI_BEHAVIOR models (optional)
     task_checkpoint_mapping: str | None = None  # Path to task-checkpoint mapping JSON file
@@ -148,6 +151,9 @@ def main(args: Args) -> None:
         time_threshold_inpaint=args.time_threshold_inpaint,
         num_steps=args.num_steps,
         apply_eval_tricks=args.apply_eval_tricks,
+        use_gt_stage=args.use_gt_stage,
+        gt_episode_length=args.gt_episode_length,
+        convert_2025_actions=args.convert_2025_actions,
     )
     
     logging.info(f"Wrapper config: execute={wrapper_config.actions_to_execute}, keep={wrapper_config.actions_to_keep}, steps={wrapper_config.execute_in_n_steps}, num_steps={wrapper_config.num_steps}")
@@ -156,6 +162,12 @@ def main(args: Args) -> None:
         logging.info("Eval tricks ENABLED - correction rules and gripper variation checks active")
     else:
         logging.info("Eval tricks DISABLED (default behavior)")
+    if wrapper_config.convert_2025_actions:
+        logging.info("2025 action adapter ENABLED (submission checkpoints only)")
+    if wrapper_config.use_gt_stage:
+        logging.info(
+            f"GT stage prompt ENABLED (episode length {wrapper_config.gt_episode_length} frames)"
+        )
 
     # Create B1K wrapper with PI_BEHAVIOR-specific features
     policy = B1KPolicyWrapper(

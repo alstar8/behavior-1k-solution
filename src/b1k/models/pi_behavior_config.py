@@ -50,6 +50,16 @@ TASK_NUM_STAGES = (
     5, 11, 5, 5, 15, 15, 5, 15, 15, 9,  # 90-99
 )
 
+# 2025 challenge (50 tasks). Stage counts differ from the 2026 table, so the
+# 2025 submission checkpoints need this tuple or task_stage_embeddings will not load.
+TASK_NUM_STAGES_2025 = (
+    5, 6, 15, 15, 14, 12, 9, 15, 10, 15,  # 0-9
+    7, 13, 10, 15, 15, 15, 15, 11, 13, 12,  # 10-19
+    14, 15, 9, 15, 15, 15, 15, 15, 15, 15,  # 20-29
+    11, 10, 10, 13, 5, 5, 14, 6, 8, 10,  # 30-39
+    5, 15, 8, 15, 12, 11, 9, 14, 15, 15,  # 40-49
+)
+
 MAX_NUM_STAGES = 15  # Maximum stages per task
 TOTAL_TASK_STAGE_EMBEDDINGS = sum(TASK_NUM_STAGES)  # 1087 for 2026 100-task set
 
@@ -73,6 +83,8 @@ class PiBehaviorConfig(_model.BaseModelConfig):
     # Use the 2025 submission's 50-task stage table so checkpoint-2 stage
     # embeddings keep their original offsets.
     legacy_stage_counts: bool = False
+    # Per-task stage counts. None uses the 2026 table, unless legacy_stage_counts is set.
+    task_num_stages: tuple[int, ...] | None = None
     # Task embedding dimension - will match the paligemma width
     task_embedding_dim: int = None  # type: ignore
     # Maximum number of subtask states across all tasks
@@ -135,9 +147,7 @@ class PiBehaviorConfig(_model.BaseModelConfig):
     cfg_guidance_weight: float = 1.0
 
     def resolved_stage_counts(self) -> tuple[int, ...]:
-        if self.legacy_stage_counts:
-            return TASK_NUM_STAGES_2025
-        return TASK_NUM_STAGES
+        return self.resolved_task_num_stages()
 
     def resolved_stage_offsets(self) -> tuple[int, ...]:
         offsets: list[int] = []
@@ -168,6 +178,13 @@ class PiBehaviorConfig(_model.BaseModelConfig):
             nnx_utils.PathRegex(".*fusion_layer.*"),
             nnx_utils.PathRegex(".*stage_projection.*"),
         )
+
+    def resolved_task_num_stages(self) -> tuple[int, ...]:
+        if self.task_num_stages is not None:
+            return tuple(self.task_num_stages)
+        if self.legacy_stage_counts:
+            return TASK_NUM_STAGES_2025
+        return TASK_NUM_STAGES
 
     def __post_init__(self):
         if self.legacy_stage_counts and self.num_tasks != len(TASK_NUM_STAGES_2025):
