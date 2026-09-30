@@ -24,6 +24,17 @@ if TYPE_CHECKING:
     from b1k.models.pi_behavior import PiBehavior
 
 
+# 2025 submission stage counts (50 tasks, 596 embeddings). Checkpoint 2 indexes
+# task_stage_embeddings with this table. The 2026 counts differ by a stage or
+# two on most tasks, so they must not be mixed with those weights.
+TASK_NUM_STAGES_2025 = (
+    5, 6, 15, 15, 14, 12, 9, 15, 10, 15,  # 0-9
+    7, 13, 10, 15, 15, 15, 15, 11, 13, 12,  # 10-19
+    14, 15, 9, 15, 15, 15, 15, 15, 15, 15,  # 20-29
+    11, 10, 10, 13, 5, 5, 14, 6, 8, 10,  # 30-39
+    5, 15, 8, 15, 12, 11, 9, 14, 15, 15,  # 40-49
+)
+
 # Per-task stage counts for the 2026 100-task challenge
 # (mean episode length / 900, rounded and clipped to [5, 15]).
 TASK_NUM_STAGES = (
@@ -59,6 +70,9 @@ class PiBehaviorConfig(_model.BaseModelConfig):
     
     # Number of tasks in the behavior dataset
     num_tasks: int = 100
+    # Use the 2025 submission's 50-task stage table so checkpoint-2 stage
+    # embeddings keep their original offsets.
+    legacy_stage_counts: bool = False
     # Task embedding dimension - will match the paligemma width
     task_embedding_dim: int = None  # type: ignore
     # Maximum number of subtask states across all tasks
@@ -120,6 +134,26 @@ class PiBehaviorConfig(_model.BaseModelConfig):
     # Test-time guidance: v = v_null + w * (v_forward - v_null). w=1 is the forward-conditioned policy.
     cfg_guidance_weight: float = 1.0
 
+    def resolved_stage_counts(self) -> tuple[int, ...]:
+        if self.legacy_stage_counts:
+            return TASK_NUM_STAGES_2025
+        return TASK_NUM_STAGES
+
+    def resolved_stage_offsets(self) -> tuple[int, ...]:
+        offsets: list[int] = []
+        running = 0
+        for count in self.resolved_stage_counts():
+            offsets.append(running)
+            running += count
+        return tuple(offsets)
+
+    def resolved_num_stage_embeddings(self) -> int:
+        return sum(self.resolved_stage_counts())
+
+    def get_vision_freeze_filter(self) -> nnx.filterlib.Filter:
+        """Freeze the SigLIP vision encoder. The language model stays trainable."""
+        return nnx_utils.PathRegex(r".*PaliGemma/img.*")
+
     def get_task_and_system2_freeze_filter(self) -> nnx.filterlib.Filter:
         """Freeze task embeddings and System-2 stage modules during specialist finetuning."""
         from openpi.shared import nnx_utils
@@ -136,6 +170,10 @@ class PiBehaviorConfig(_model.BaseModelConfig):
         )
 
     def __post_init__(self):
+        if self.legacy_stage_counts and self.num_tasks != len(TASK_NUM_STAGES_2025):
+            raise ValueError(
+                f"legacy_stage_counts requires num_tasks={len(TASK_NUM_STAGES_2025)}, got {self.num_tasks}"
+            )
         if self.task_embedding_dim is None:
             paligemma_config = _gemma.get_config(self.paligemma_variant)
             object.__setattr__(self, "task_embedding_dim", paligemma_config.width)

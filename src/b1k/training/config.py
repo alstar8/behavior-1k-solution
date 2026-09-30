@@ -111,10 +111,13 @@ class ModelTransformFactory(GroupFactory):
     default_prompt: str | None = None  # Not used (task embeddings instead)
 
     def __call__(self, model_config: _model.BaseModelConfig) -> _transforms.Group:
+        stage_counts = None
+        if getattr(model_config, "legacy_stage_counts", False):
+            stage_counts = pi_behavior_config.TASK_NUM_STAGES_2025
         return _transforms.Group(
             inputs=[
                 _transforms.ResizeImages(224, 224),
-                b1k_transforms.ComputeSubtaskStateFromMeta(dataset=None),
+                b1k_transforms.ComputeSubtaskStateFromMeta(dataset=None, stage_counts=stage_counts),
                 b1k_transforms.TaskIndexToTaskId(),
                 _transforms.PadStatesAndActions(model_config.action_dim),
             ],
@@ -359,11 +362,18 @@ def _2026_challenge_task_names() -> list[str]:
 # Checkpoint 3 from the 2025 solution (task_checkpoint_mapping.json).
 # Ids: 4, 27, 31, 32, 33, 35, 36, 37, 38, 39, 41, 46, 49.
 _CHECKPOINT3_TASK_IDS = (4, 27, 31, 32, 33, 35, 36, 37, 38, 39, 41, 46, 49)
+# Checkpoint 2 from the 2025 solution.
+_CHECKPOINT2_TASK_IDS = (0, 1, 7, 8, 9, 12, 16, 17, 18, 20, 21, 22, 26, 30, 43, 45)
 
 
 def _checkpoint3_task_names() -> list[str]:
     names = _2026_challenge_task_names()
     return [names[task_id] for task_id in _CHECKPOINT3_TASK_IDS]
+
+
+def _checkpoint2_task_names() -> list[str]:
+    names = _2026_challenge_task_names()
+    return [names[task_id] for task_id in _CHECKPOINT2_TASK_IDS]
 
 
 def get_data_factories(config: "TrainConfig") -> list[DataConfigFactory]:
@@ -664,6 +674,187 @@ _CONFIGS = [
             "/workspace-SR008.nfs2/datasets/staroverov_b1k/behavior/b1k_solution/"
             "pi_behavior_2026_ckpt3_13tasks_demo0_6_comet0_4/"
             "pi_behavior_2026_ckpt3_13tasks_20260924_232445/20000/params"
+        ),
+        num_train_steps=20_000,
+        assets_base_dir="./outputs/assets",
+        checkpoint_base_dir="/workspace-SR008.nfs2/datasets/staroverov_b1k/behavior/b1k_solution",
+        num_workers=64,
+        batch_size=512,
+        fsdp_devices=4,
+        save_interval=2_000,
+        keep_period=10_000,
+        log_interval=25,
+    ),
+    # Continue the 13-task CFGRL run with the stage head and task embeddings
+    # trainable. The vision backbone stays frozen. Optimizer state starts fresh
+    # because those parameters were excluded from the previous Adam state.
+    TrainConfig(
+        name="pi_behavior_2026_ckpt3_13tasks_cfgrl_rewind_system2",
+        exp_name="openpi",
+        project_name="B1K",
+        model=pi_behavior_config.PiBehaviorConfig(
+            action_horizon=30,
+            action_dim=32,
+            use_correlated_noise=True,
+            correlation_beta=0.5,
+            use_fast_auxiliary=True,
+            fast_loss_weight=0.05,
+            fast_encoded_dims="0:6,7:23",
+            fast_vocab_size=1024,
+            max_fast_tokens=200,
+            use_kv_transform=True,
+            use_knowledge_insulation=False,
+            subtask_loss_weight=0.1,
+            freeze_vision_backbone=True,
+            num_tasks=100,
+            use_optimality=True,
+            cfg_guidance_weight=1.5,
+        ),
+        sample_weights=[0.6, 0.4],
+        data=[
+            LeRobotB1KDataConfig(
+                repo_id="behavior-1k/2026-challenge-demos",
+                assets=AssetsConfig(
+                    assets_dir="./outputs/assets/pi_behavior_2026_all100_demo0_6_comet0_4",
+                    asset_id="behavior-1k/2026-challenge-demos",
+                ),
+                base_config=DataConfig(
+                    prompt_from_task=False,
+                    behavior_dataset_root=_behavior_dataset_root("2026-challenge-demos"),
+                    use_per_timestamp_norm=True,
+                    tasks=_checkpoint3_task_names(),
+                    episodes_index=list(range(200)),
+                    tolerance_s=1.0 / 30.0,
+                    cfgrl_rewind=True,
+                ),
+                use_delta_joint_actions=True,
+                use_fast_tokenization=True,
+            ),
+            LeRobotB1KDataConfig(
+                repo_id="delinqu/comet-1.5k",
+                assets=AssetsConfig(
+                    assets_dir="./outputs/assets/pi_behavior_2026_all100_demo0_6_comet0_4",
+                    asset_id="behavior-1k/2026-challenge-demos",
+                ),
+                base_config=DataConfig(
+                    prompt_from_task=False,
+                    behavior_dataset_root=_behavior_dataset_root("comet-1.5k"),
+                    use_per_timestamp_norm=True,
+                    tasks=_checkpoint3_task_names(),
+                    align_legacy_rft_to_2026=True,
+                    tolerance_s=1.0 / 30.0,
+                    cfgrl_rewind=True,
+                ),
+                use_delta_joint_actions=True,
+                use_fast_tokenization=True,
+            ),
+        ],
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=200,
+            peak_lr=2.5e-5,
+            decay_steps=20_000,
+            decay_lr=2.5e-6,
+        ),
+        num_flow_samples=15,
+        weight_loader=weight_loaders.PiBehaviorWeightLoader(
+            "/workspace-SR008.nfs2/datasets/staroverov_b1k/behavior/b1k_solution/"
+            "pi_behavior_2026_ckpt3_13tasks_cfgrl_rewind/"
+            "pi_behavior_2026_ckpt3_cfgrl_rewind_20260927_191143/10000/params"
+        ),
+        num_train_steps=20_000,
+        assets_base_dir="./outputs/assets",
+        checkpoint_base_dir="/workspace-SR008.nfs2/datasets/staroverov_b1k/behavior/b1k_solution",
+        num_workers=64,
+        batch_size=512,
+        fsdp_devices=4,
+        save_interval=2_000,
+        keep_period=10_000,
+        log_interval=25,
+    ),
+    # 2025 submission checkpoint 2 (16 tasks), finetuned on the same 2026 task ids.
+    # Full model except the SigLIP vision encoder. CFGRL rewind labels. Comet
+    # RFT labels are the next row for every action slice. 2026 labels keep base
+    # velocity on the observation row and take trunk, arms, and grippers from
+    # the previous row. Base velocity is the recorded command, not rescaled.
+    # Comet has no trajectories for picking_up_toys, sorting_vegetables, or
+    # assembling_gift_baskets. Stage counts stay on the 2025 table so the
+    # loaded stage embeddings keep their offsets. optimality_embed starts at 0.
+    TrainConfig(
+        name="pi_behavior_2026_ckpt2_16tasks_cfgrl_rewind",
+        exp_name="openpi",
+        project_name="B1K",
+        model=pi_behavior_config.PiBehaviorConfig(
+            action_horizon=30,
+            action_dim=32,
+            use_correlated_noise=True,
+            correlation_beta=0.5,
+            use_fast_auxiliary=True,
+            fast_loss_weight=0.05,
+            fast_encoded_dims="0:6,7:23",
+            fast_vocab_size=1024,
+            max_fast_tokens=200,
+            use_kv_transform=True,
+            use_knowledge_insulation=False,
+            subtask_loss_weight=0.1,
+            freeze_vision_backbone=True,
+            num_tasks=50,
+            legacy_stage_counts=True,
+            use_optimality=True,
+            cfg_guidance_weight=1.5,
+        ),
+        sample_weights=[0.6, 0.4],
+        data=[
+            LeRobotB1KDataConfig(
+                repo_id="behavior-1k/2026-challenge-demos",
+                assets=AssetsConfig(
+                    assets_dir="./outputs/assets/pi_behavior_2026_all100_demo0_6_comet0_4",
+                    asset_id="behavior-1k/2026-challenge-demos",
+                ),
+                base_config=DataConfig(
+                    prompt_from_task=False,
+                    behavior_dataset_root=_behavior_dataset_root("2026-challenge-demos"),
+                    use_per_timestamp_norm=True,
+                    tasks=_checkpoint2_task_names(),
+                    episodes_index=list(range(200)),
+                    tolerance_s=1.0 / 30.0,
+                    cfgrl_rewind=True,
+                ),
+                use_delta_joint_actions=True,
+                use_fast_tokenization=True,
+            ),
+            LeRobotB1KDataConfig(
+                repo_id="delinqu/comet-1.5k",
+                assets=AssetsConfig(
+                    assets_dir="./outputs/assets/pi_behavior_2026_all100_demo0_6_comet0_4",
+                    asset_id="behavior-1k/2026-challenge-demos",
+                ),
+                base_config=DataConfig(
+                    prompt_from_task=False,
+                    behavior_dataset_root=_behavior_dataset_root("comet-1.5k"),
+                    use_per_timestamp_norm=True,
+                    tasks=_checkpoint2_task_names(),
+                    align_legacy_rft_to_2026=True,
+                    tolerance_s=1.0 / 30.0,
+                    cfgrl_rewind=True,
+                ),
+                use_delta_joint_actions=True,
+                use_fast_tokenization=True,
+            ),
+        ],
+        freeze_filter=pi_behavior_config.PiBehaviorConfig(
+            num_tasks=50,
+            legacy_stage_counts=True,
+        ).get_vision_freeze_filter(),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=200,
+            peak_lr=2.5e-5,
+            decay_steps=20_000,
+            decay_lr=2.5e-6,
+        ),
+        num_flow_samples=15,
+        weight_loader=weight_loaders.PiBehaviorWeightLoader(
+            "/workspace-SR008.nfs2/datasets/staroverov_b1k/behavior/pretrained/"
+            "behavior_submission/checkpoint_2/params"
         ),
         num_train_steps=20_000,
         assets_base_dir="./outputs/assets",

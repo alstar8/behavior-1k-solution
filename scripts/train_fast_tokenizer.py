@@ -24,6 +24,9 @@ import openpi.transforms as transforms
 
 # Import B1K-specific modules
 from b1k.training import config as _config
+from b1k.action_alignment import aligned_action_chunks
+from b1k.action_alignment import apply_joint_delta
+from b1k.action_alignment import leads_for_source
 from b1k.shared.b1k_proprio import extract_state_from_proprio, legacy_proprio_to_compact
 
 
@@ -80,17 +83,11 @@ def process_episode_file(args):
                 states = states[None, :]
                 raw_actions = raw_actions[None, :]
 
-            if len(raw_actions) < action_horizon:
+            leads = leads_for_source(rft=bool(align_legacy))
+            action_chunks, chunk_index = aligned_action_chunks(raw_actions, leads, action_horizon)
+            if len(chunk_index) == 0:
                 continue
-
-            mask = np.asarray(delta_mask)
-            dims = mask.shape[-1]
-            windows = np.lib.stride_tricks.sliding_window_view(raw_actions, (action_horizon, raw_actions.shape[1]))[:, 0]
-            state_exp = states[: windows.shape[0], None, :]
-            action_chunks = windows.copy()
-            action_chunks[..., :dims] = np.where(
-                mask, windows[..., :dims] - state_exp[..., :dims], windows[..., :dims]
-            )
+            action_chunks = apply_joint_delta(action_chunks, states[chunk_index], delta_mask)
             if sample_fraction < 1.0:
                 n_chunks = len(action_chunks)
                 n_samples = max(1, int(n_chunks * sample_fraction))

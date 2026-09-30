@@ -22,6 +22,9 @@ import openpi.transforms as transforms
 # Import B1K-specific modules  
 from b1k.shared import normalize
 from b1k.training import config as _config
+from b1k.action_alignment import aligned_action_chunks
+from b1k.action_alignment import apply_joint_delta
+from b1k.action_alignment import leads_for_source
 from b1k.shared.b1k_proprio import extract_state_from_proprio, legacy_proprio_to_compact
 
 
@@ -146,13 +149,11 @@ def _process_episode_frames(
         raw_actions = raw_actions[None, :]
         raw_state = raw_state[None, :]
 
-    mask = np.asarray(delta_mask)
-    dims = mask.shape[-1]
-    actions = raw_actions.copy()
-    actions[:, :dims] = np.where(mask, raw_actions[:, :dims] - states[:, :dims], raw_actions[:, :dims])
-
-    if len(states) == 0:
+    leads = leads_for_source(rft=bool(align_legacy))
+    single_chunks, single_index = aligned_action_chunks(raw_actions, leads, 1)
+    if len(single_index) == 0 or len(states) == 0:
         return None
+    actions = apply_joint_delta(single_chunks[:, 0, :], states[single_index], delta_mask)
 
     episode_stats = {
         "state": {
@@ -173,21 +174,19 @@ def _process_episode_frames(
 
     per_timestamp_data = None
     correlation_chunks = None
-    if (compute_per_timestamp or compute_correlation) and len(states) >= action_horizon:
-        horizon = action_horizon
-        windows = np.lib.stride_tricks.sliding_window_view(raw_actions, (horizon, raw_actions.shape[1]))[:, 0]
-        state_exp = states[: windows.shape[0], None, :]
-        delta_chunks = windows.copy()
-        delta_chunks[..., :dims] = np.where(
-            mask, windows[..., :dims] - state_exp[..., :dims], windows[..., :dims]
-        )
-        rng = np.random.RandomState(hash(str(episode_file)) % (2**31))
-        n_chunk_samples = max(1, int(len(delta_chunks) * sample_fraction))
-        if sample_fraction < 1.0 and n_chunk_samples < len(delta_chunks):
-            chunk_indices = rng.choice(len(delta_chunks), size=n_chunk_samples, replace=False)
-            sampled_chunks = delta_chunks[chunk_indices]
+    if compute_per_timestamp or compute_correlation:
+        delta_chunks, chunk_index = aligned_action_chunks(raw_actions, leads, action_horizon)
+        if len(chunk_index) == 0:
+            sampled_chunks = None
         else:
-            sampled_chunks = delta_chunks
+            delta_chunks = apply_joint_delta(delta_chunks, states[chunk_index], delta_mask)
+            rng = np.random.RandomState(hash(str(episode_file)) % (2**31))
+            n_chunk_samples = max(1, int(len(delta_chunks) * sample_fraction))
+            if sample_fraction < 1.0 and n_chunk_samples < len(delta_chunks):
+                chunk_indices = rng.choice(len(delta_chunks), size=n_chunk_samples, replace=False)
+                sampled_chunks = delta_chunks[chunk_indices]
+            else:
+                sampled_chunks = delta_chunks
         if compute_per_timestamp:
             per_timestamp_data = sampled_chunks
         if compute_correlation:

@@ -40,7 +40,7 @@ dev = [
 ]
 
 [tool.uv.sources]
-openpi = { path = "openpi", editable = true }
+openpi = { path = "../B1K_AIRI/openpi_comet", editable = true }
 
 [build-system]
 requires = ["setuptools>=45", "wheel"]

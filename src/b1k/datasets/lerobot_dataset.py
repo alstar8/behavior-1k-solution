@@ -39,6 +39,9 @@ import torch as th
 from torch.utils.data import Dataset
 from torch.utils.data import get_worker_info
 
+from b1k.action_alignment import ACTION_SLICES
+from b1k.action_alignment import assemble_action
+from b1k.action_alignment import valid_observation_range
 from b1k.cfgrl import OPT_DROPOUT
 from b1k.cfgrl import OPT_FORWARD
 from b1k.cfgrl import OPT_REWIND
@@ -288,6 +291,8 @@ class BehaviorLeRobotDataset(LeRobotDataset):
         cfgrl_rewind: bool = False,
         cfgrl_rewind_prob: float = 0.5,
         cfgrl_dropout_prob: float = 0.1,
+        action_leads: dict[str, int] | None = None,
+        action_horizon: int = 30,
     ):
         """
         Custom args:
@@ -335,6 +340,16 @@ class BehaviorLeRobotDataset(LeRobotDataset):
         self.cfgrl_rewind = cfgrl_rewind
         self.cfgrl_rewind_prob = cfgrl_rewind_prob
         self.cfgrl_dropout_prob = cfgrl_dropout_prob
+        # Per-slice lead of the action label relative to the observation row.
+        # None keeps the action stored on that same row.
+        if action_leads is None:
+            self.action_leads = None
+        else:
+            missing = [name for name in ACTION_SLICES if name not in action_leads]
+            if missing:
+                raise ValueError(f"action_leads missing {missing}")
+            self.action_leads = {name: int(action_leads[name]) for name in ACTION_SLICES}
+        self.action_horizon = int(action_horizon)
 
         # Unused attributes
         self.image_writer = None
@@ -608,13 +623,16 @@ class BehaviorLeRobotDataset(LeRobotDataset):
 
     def __getitem__(self, idx) -> dict:
         if not self._chunk_streaming_using_keyframe:
-            max_attempts = min(32, len(self))
+            max_attempts = min(len(self), max(32, self.action_horizon + 4))
             for attempt in range(max_attempts):
                 candidate_idx = (int(idx) + attempt) % len(self)
                 try:
                     item = super().__getitem__(candidate_idx)
                     item["task"] = self._get_fine_grained_task(item)
                     item = self._alias_v3_rgb_keys(item)
+                    item = self._attach_aligned_action(item, candidate_idx)
+                    if item is None:
+                        continue
                     if self.cfgrl_rewind:
                         item = self._apply_cfgrl_rewind(item, candidate_idx)
                     return item
@@ -655,6 +673,9 @@ class BehaviorLeRobotDataset(LeRobotDataset):
         item = self.hf_dataset[self.current_streaming_frame_idx]
         item.pop("observation.task_info", None)
         ep_idx = item["episode_index"].item()
+        if not self._action_window_fits(self.current_streaming_frame_idx, ep_idx):
+            self.current_streaming_frame_idx += 1
+            return self.__getitem__(idx)
 
         if self._should_obs_loaders_reload:
             from omnigibson.eval.utils.obs_utils import OBS_LOADER_MAP
@@ -744,33 +765,89 @@ class BehaviorLeRobotDataset(LeRobotDataset):
                 item[cam] = self.image_transforms(item[cam])
 
         # Add task as a string
+        frame_idx = self.current_streaming_frame_idx
         item["task"] = self._get_fine_grained_task(item)
+        item = self._attach_aligned_action(item, frame_idx)
         self.current_streaming_frame_idx += 1
+        if item is None:
+            return self.__getitem__(idx)
 
         return self._alias_v3_rgb_keys(item)
+
+    def _episode_bounds(self, episode_index: int) -> tuple[int, int]:
+        ep_pos = int(self.episode_data_index_pos[int(episode_index)])
+        return (
+            int(self.episode_data_index["from"][ep_pos]),
+            int(self.episode_data_index["to"][ep_pos]),
+        )
+
+    def _action_window_fits(self, index: int, episode_index: int) -> bool:
+        if self.action_leads is None:
+            return True
+        ep_start, ep_end = self._episode_bounds(episode_index)
+        local_t = int(index) - ep_start
+        start, stop = valid_observation_range(ep_end - ep_start, self.action_leads, self.action_horizon)
+        return start <= local_t < stop
+
+    def _read_action_rows(self, start: int, end: int) -> np.ndarray:
+        rows = self.hf_dataset[int(start) : int(end)]["action"]
+        block = np.asarray(rows, dtype=np.float32)
+        if block.ndim == 1:
+            block = block.reshape(1, -1)
+        return block
+
+    def _assemble_at(self, index: int, episode_index: int) -> np.ndarray | None:
+        if self.action_leads is None:
+            return None
+        ep_start, ep_end = self._episode_bounds(episode_index)
+        local_t = int(index) - ep_start
+        horizon = self.action_horizon
+        start, stop = valid_observation_range(ep_end - ep_start, self.action_leads, horizon)
+        if local_t < start or local_t >= stop:
+            return None
+        span0 = min(local_t + lead for lead in self.action_leads.values())
+        span1 = max(local_t + lead + horizon for lead in self.action_leads.values())
+        block = self._read_action_rows(ep_start + span0, ep_start + span1)
+        return assemble_action(block, local_t - span0, horizon, self.action_leads)
+
+    def _attach_aligned_action(self, item: dict, index: int) -> dict | None:
+        """Keep images and proprio on this row. Replace only the action label."""
+        if self.action_leads is None:
+            return item
+        aligned = self._assemble_at(index, int(item["episode_index"]))
+        if aligned is None:
+            return None
+        item = dict(item)
+        item["action"] = th.as_tensor(aligned, dtype=th.float32)
+        return item
 
     def _apply_cfgrl_rewind(self, item: dict, index: int) -> dict:
         """Label some samples with the action chunk that undoes the previous chunk.
 
-        The current frame stays the observation. Past actions are read from the dataset
-        table, reversed, and tagged optimality 1. Forward samples stay optimality 2.
-        Ten percent of examples drop the label to 0.
+        The current frame stays the observation. The past label uses the same
+        per-slice leads as the forward label, then it is reversed. Forward
+        samples stay optimality 2. Ten percent of examples drop the label to 0.
         """
         label = OPT_FORWARD
         actions = item.get("action")
         horizon = int(actions.shape[0]) if actions is not None else 0
         past_index = index - (horizon - 1)
         episode_index = int(item["episode_index"])
-        ep_pos = int(self.episode_data_index_pos[episode_index])
-        ep_start = int(self.episode_data_index["from"][ep_pos])
+        ep_start, _ep_end = self._episode_bounds(episode_index)
         can_rewind = horizon > 1 and past_index >= ep_start
         if can_rewind and random.random() < self.cfgrl_rewind_prob:
             try:
-                past = self.hf_dataset[past_index : index + 1]
-                past_actions = np.asarray(past["action"], dtype=np.float32)
-                if past_actions.shape[0] != horizon:
-                    raise RuntimeError(f"past action window {past_actions.shape} != {horizon}")
-                start_state = state_from_proprio(np.asarray(past["observation.state"])[0])
+                if self.action_leads is None:
+                    past = self.hf_dataset[past_index : index + 1]
+                    past_actions = np.asarray(past["action"], dtype=np.float32)
+                else:
+                    past_actions = self._assemble_at(past_index, episode_index)
+                if past_actions is None or past_actions.shape[0] != horizon:
+                    raise RuntimeError(f"past action window does not fit at {past_index}")
+                start_proprio = np.asarray(
+                    self.hf_dataset[past_index]["observation.state"], dtype=np.float32
+                )
+                start_state = state_from_proprio(start_proprio)
                 item = dict(item)
                 item["action"] = th.as_tensor(
                     rewind_absolute_actions(past_actions, start_state),

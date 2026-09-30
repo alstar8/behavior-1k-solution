@@ -20,6 +20,8 @@ from openpi.training.data_loader import (
 from b1k.training import config as _config
 import openpi.transforms as _transforms
 
+from b1k import transforms as b1k_transforms
+from b1k.action_alignment import leads_for_source
 from b1k.models.observation import Observation
 from b1k.transforms_normalize import NormalizeWithPerTimestamp
 
@@ -57,13 +59,25 @@ def create_behavior_dataset(data_config: _config.DataConfig, action_horizon: int
     Uses the 2026-capable BehaviorLeRobotDataset (LeRobot v3 parquet + 2025 jsonl).
     """
     from b1k.datasets.lerobot_dataset import BehaviorLeRobotDataset
-    from b1k import transforms as b1k_transforms
 
     if seed is None:
         seed = int(time.time() * 1000) % (2**32)
         logging.info(f"Using random seed for BehaviorLeRobotDataset: {seed}")
 
     tasks = data_config.tasks
+    # Images and the full proprioception vector stay on the observation row.
+    # RFT stores the command just applied, so every slice is the next row.
+    # 2026 arm and trunk joints match the command from two rows earlier, so
+    # their label is the previous row. 2026 base velocity matches the command
+    # from one row earlier, so it stays on this row. Grippers follow the arms.
+    # The recorded base velocity is kept as stored.
+    rft = bool(getattr(data_config, "align_legacy_rft_to_2026", False))
+    action_leads = leads_for_source(rft=rft)
+    logging.info(
+        "Action leads (%s): %s",
+        "RFT" if rft else "2026",
+        ", ".join(f"{name}={action_leads[name]:+d}" for name in action_leads),
+    )
 
     dataset = BehaviorLeRobotDataset(
         repo_id=data_config.repo_id,
@@ -71,9 +85,6 @@ def create_behavior_dataset(data_config: _config.DataConfig, action_horizon: int
         tasks=tasks,
         modalities=list(data_config.modalities) if data_config.modalities else ["rgb"],
         local_only=True,
-        delta_timestamps={
-            key: [t / 30.0 for t in range(action_horizon)] for key in data_config.action_sequence_keys
-        },
         episodes=data_config.episodes_index,
         chunk_streaming_using_keyframe=False,
         shuffle=True,
@@ -82,6 +93,8 @@ def create_behavior_dataset(data_config: _config.DataConfig, action_horizon: int
         check_timestamp_sync=False,
         fine_grained_level=0,
         cfgrl_rewind=bool(getattr(data_config, "cfgrl_rewind", False)),
+        action_leads=action_leads,
+        action_horizon=action_horizon,
     )
 
     pre_transforms = []
@@ -143,8 +156,12 @@ def transform_dataset(dataset: Dataset, data_config: _config.DataConfig, *, skip
     model_transforms = []
     for transform in data_config.model_transforms.inputs:
         if hasattr(transform, "__class__") and transform.__class__.__name__ == "ComputeSubtaskStateFromMeta":
-            from b1k import transforms as b1k_transforms
-            model_transforms.append(b1k_transforms.ComputeSubtaskStateFromMeta(dataset=dataset))
+            model_transforms.append(
+                b1k_transforms.ComputeSubtaskStateFromMeta(
+                    dataset=dataset,
+                    stage_counts=getattr(transform, "stage_counts", None),
+                )
+            )
         else:
             model_transforms.append(transform)
     

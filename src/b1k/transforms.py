@@ -152,6 +152,9 @@ class ComputeSubtaskStateFromMeta(DataTransformFn):
     """
     
     dataset: object | None = None  # Will be set by data loader
+    # Per-task stage counts. None uses the 2026 table. Checkpoint-2 finetunes
+    # pass the 2025 table so labels match the loaded stage embeddings.
+    stage_counts: tuple[int, ...] | None = None
     
     def __call__(self, data: DataDict) -> DataDict:
         data = dict(data)
@@ -161,12 +164,12 @@ class ComputeSubtaskStateFromMeta(DataTransformFn):
 
         timestamp = float(np.asarray(data["timestamp"]).reshape(-1)[0])
         task_index = int(np.asarray(data.get("task_index", 0)).reshape(-1)[0])
-        if not (0 <= task_index < len(TASK_NUM_STAGES)):
+        stage_counts = self.stage_counts if self.stage_counts is not None else TASK_NUM_STAGES
+        if not (0 <= task_index < len(stage_counts)):
             logging.warning(f"Invalid task_index {task_index}, using stage 0")
             data["subtask_state"] = np.array(0, dtype=np.int32)
             return data
-
-        num_stages = TASK_NUM_STAGES[task_index]
+        num_stages = stage_counts[task_index]
         episode_length = None
         if "episode_length" in data:
             episode_length = float(np.asarray(data["episode_length"]).reshape(-1)[0])
