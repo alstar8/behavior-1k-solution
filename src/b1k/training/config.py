@@ -852,7 +852,8 @@ _CONFIGS = [
             use_optimality=True,
             cfg_guidance_weight=1.5,
         ),
-        sample_weights=[0.6, 0.4],
+        # Frame counts: 38,054,276 demos and 8,144,915 Comet. Equal epoch at the same step.
+        sample_weights=[0.824, 0.176],
         data=[
             LeRobotB1KDataConfig(
                 repo_id="behavior-1k/2026-challenge-demos",
@@ -906,7 +907,7 @@ _CONFIGS = [
             "/workspace-SR008.nfs2/datasets/staroverov_b1k/behavior/pretrained/"
             "behavior_submission/checkpoint_2/params"
         ),
-        num_train_steps=20_000,
+        num_train_steps=66_840,
         assets_base_dir="./outputs/assets",
         checkpoint_base_dir="/workspace-SR008.nfs2/datasets/staroverov_b1k/behavior/b1k_solution",
         num_workers=64,

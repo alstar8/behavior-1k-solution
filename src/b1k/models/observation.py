@@ -26,6 +26,10 @@ def _as_optimality(value: ArrayT | None) -> ArrayT | None:
         return None
     if isinstance(value, torch.Tensor):
         value = value.detach().cpu().numpy()
+    # Global JAX batches are not host-addressable on every device. Keep the cast
+    # on device so multi-node training does not gather the full array.
+    if isinstance(value, jax.Array):
+        return jnp.squeeze(value.astype(jnp.int32))
     array = np.asarray(value, dtype=np.int32)
     return np.squeeze(array)
 

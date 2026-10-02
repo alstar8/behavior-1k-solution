@@ -9,6 +9,7 @@ import functools
 import logging
 import os
 import platform
+import threading
 import time
 from typing import Any
 
@@ -17,7 +18,7 @@ import flax.nnx as nnx
 from flax.training import common_utils
 import flax.traverse_util as traverse_util
 import jax
-import jax.experimental
+import jax.experimental.multihost_utils
 import jax.numpy as jnp
 import numpy as np
 import optax
@@ -342,16 +343,53 @@ def train_step(
     return new_state, info
 
 
+def _compile_heartbeat(stop: threading.Event, started: float) -> None:
+    """Log elapsed time while the first training step is compiling."""
+    while not stop.wait(60):
+        elapsed_min = (time.monotonic() - started) / 60
+        logging.info("First step still compiling, elapsed %.1f min", elapsed_min)
+
+
+def _maybe_init_distributed() -> None:
+    """Join a multi-node JAX process group when the launcher sets WORLD_SIZE."""
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    if world_size <= 1:
+        return
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+    local_ids = [part for part in visible.split(",") if part != ""]
+    if not local_ids:
+        raise RuntimeError("CUDA_VISIBLE_DEVICES must list the local GPUs for multi-node training")
+    jax.distributed.initialize(
+        coordinator_address=f"{os.environ['MASTER_ADDR']}:{os.environ['MASTER_PORT']}",
+        process_id=int(os.environ["WORLD_RANK"]),
+        num_processes=world_size,
+        local_device_ids=list(range(len(local_ids))),
+        initialization_timeout=int(os.environ.get("JAX_COORDINATION_TIMEOUT", "600")),
+    )
+
+
 def main(config: _config.TrainConfig):
+    _maybe_init_distributed()
     init_logging()
     logging.info(f"Running on: {platform.node()}")
+    logging.info(
+        f"JAX process {jax.process_index()}/{jax.process_count()} "
+        f"local_devices={jax.local_device_count()} global_devices={jax.device_count()}"
+    )
 
     if config.batch_size % jax.device_count() != 0:
         raise ValueError(
             f"Batch size {config.batch_size} must be divisible by the number of devices {jax.device_count()}."
         )
 
-    jax.config.update("jax_compilation_cache_dir", str(epath.Path("~/.cache/jax").expanduser()))
+    # Shared across nodes. A per-node cache lets rank 0 skip compile and
+    # wait in the NCCL clique while the other ranks are still compiling.
+    cache_dir = os.environ.get(
+        "JAX_COMPILATION_CACHE_DIR",
+        "/workspace-SR008.nfs2/users/staroverov/.cache/jax",
+    )
+    jax.config.update("jax_compilation_cache_dir", cache_dir)
+    logging.info("JAX compilation cache: %s", cache_dir)
 
     # Generate random seed if not provided
     seed = config.seed
@@ -372,7 +410,10 @@ def main(config: _config.TrainConfig):
         overwrite=config.overwrite,
         resume=config.resume,
     )
-    init_wandb(config, resuming=resuming, enabled=config.wandb_enabled)
+    if jax.process_count() > 1:
+        jax.experimental.multihost_utils.sync_global_devices("ckpt_dir_ready")
+    if jax.process_index() == 0:
+        init_wandb(config, resuming=resuming, enabled=config.wandb_enabled)
 
     data_loader = _data_loader.create_behavior_data_loader(
         config,
@@ -384,12 +425,14 @@ def main(config: _config.TrainConfig):
     batch = next(data_iter)
     logging.info(f"Initialized data loader:\n{training_utils.array_tree_to_info(batch)}")
 
-    # Log images from first batch to sanity check.
-    images_to_log = [
-        wandb.Image(np.concatenate([np.array(img[i]) for img in batch[0].images.values()], axis=1))
-        for i in range(min(5, len(next(iter(batch[0].images.values())))))
-    ]
-    wandb.log({"camera_views": images_to_log}, step=0)
+    # Host transfer of a globally sharded batch is collective, so every process
+    # must take it. Multi-node runs skip the sanity-check images.
+    if jax.process_count() == 1:
+        images_to_log = [
+            wandb.Image(np.concatenate([np.array(img[i]) for img in batch[0].images.values()], axis=1))
+            for i in range(min(5, len(next(iter(batch[0].images.values())))))
+        ]
+        wandb.log({"camera_views": images_to_log}, step=0)
 
     # Get norm_stats for correlation matrix loading
     data_config = data_loader.data_config()
@@ -406,7 +449,12 @@ def main(config: _config.TrainConfig):
     logging.info(f"Initialized train state:\n{training_utils.array_tree_to_info(train_state.params)}")
 
     if resuming:
-        train_state = _checkpoints.restore_state(checkpoint_manager, train_state, data_loader)
+        train_state = _checkpoints.restore_state(
+            checkpoint_manager,
+            train_state,
+            data_loader,
+            state_sharding=train_state_sharding,
+        )
         
         # Reload correlation matrix after restore
         model = nnx.merge(train_state.model_def, train_state.params)
@@ -429,10 +477,31 @@ def main(config: _config.TrainConfig):
         dynamic_ncols=True,
     )
 
+    compile_started = time.monotonic()
+    stop_heartbeat = threading.Event()
+    if jax.process_index() == 0:
+        logging.info("First step compilation started")
+        threading.Thread(
+            target=_compile_heartbeat,
+            args=(stop_heartbeat, compile_started),
+            name="compile-heartbeat",
+            daemon=True,
+        ).start()
+
     infos = []
+    first_step = True
     for step in pbar:
         with sharding.set_mesh(mesh):
             train_state, info = ptrain_step(train_rng, train_state, batch)
+        if first_step:
+            jax.block_until_ready((train_state, info))
+            stop_heartbeat.set()
+            if jax.process_index() == 0:
+                logging.info(
+                    "First step finished, elapsed %.1f min",
+                    (time.monotonic() - compile_started) / 60,
+                )
+            first_step = False
         infos.append(info)
         if step % config.log_interval == 0:
             stacked_infos = common_utils.stack_forest(infos)
@@ -449,7 +518,8 @@ def main(config: _config.TrainConfig):
                     parts.append(f"{k}={v}")
             info_str = ", ".join(parts)
             pbar.write(f"Step {step}: {info_str}")
-            wandb.log(reduced_info, step=step)
+            if jax.process_index() == 0:
+                wandb.log(reduced_info, step=step)
             infos = []
         batch = next(data_iter)
 

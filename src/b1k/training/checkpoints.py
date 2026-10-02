@@ -10,12 +10,13 @@ import concurrent.futures as futures
 import dataclasses
 import logging
 import shutil
-from typing import Protocol
+from typing import Any, Protocol
 
 from etils import epath
 import flax.traverse_util
 import jax
 import flax.nnx as nnx
+import numpy as np
 
 import orbax.checkpoint as ocp
 import orbax.checkpoint.future as future
@@ -34,12 +35,16 @@ def initialize_checkpoint_dir(
     checkpoint_dir = epath.Path(checkpoint_dir).resolve()
     resuming = False
     if checkpoint_dir.exists():
-        if overwrite:
+        if overwrite and jax.process_index() == 0:
             checkpoint_dir.rmtree()
             checkpoint_dir.mkdir(parents=True, exist_ok=True)
             logging.info(f"Wiped checkpoint directory {checkpoint_dir}")
+        elif overwrite and jax.process_index() != 0:
+            pass
         elif resume:
             resuming = True
+        elif jax.process_index() != 0:
+            pass
         else:
             raise FileExistsError(
                 f"Checkpoint directory {checkpoint_dir} already exists. Use --overwrite or --resume "
@@ -134,21 +139,38 @@ def restore_state(
     state: training_utils.TrainState,
     data_loader: _data_loader.DataLoader,
     step: int | None = None,
+    *,
+    state_sharding: Any | None = None,
 ) -> training_utils.TrainState:
     del data_loader
 
     with at.disable_typechecking():
         # Split params that can be used for inference into a separate item.
         train_state, params = _split_params(state)
-        
+        restore_kwargs = None
+        if state_sharding is not None:
+            train_state_sharding, params_sharding = _split_sharding(state_sharding, state)
+            restore_kwargs = {
+                "train_state": {
+                    "restore_args": _make_pytree_restore_args(train_state, train_state_sharding),
+                },
+                "params": {
+                    "restore_args": _make_pytree_restore_args({"params": params}, {"params": params_sharding}),
+                },
+            }
+            logging.info(
+                "Restoring checkpoint with explicit target shardings for %d devices",
+                jax.device_count(),
+            )
         restored = checkpoint_manager.restore(
             step,
             items={
                 "train_state": train_state,
                 "params": {"params": params},
             },
+            restore_kwargs=restore_kwargs,
         )
-                
+
     return _merge_params(restored["train_state"], restored["params"])
 
 
@@ -185,6 +207,35 @@ class CallbackSave(ocp.args.CheckpointArgs):
 
 @ocp.args.register_with_handler(CallbackHandler, for_restore=True)
 class CallbackRestore(ocp.args.CheckpointArgs): ...
+
+
+def _split_sharding(
+    state_sharding: Any, state: training_utils.TrainState
+) -> tuple[Any, at.Params]:
+    if state.ema_params is not None:
+        params_sharding = state_sharding.ema_params
+        train_state_sharding = dataclasses.replace(state_sharding, ema_params=None)
+    else:
+        params_sharding = state_sharding.params
+        train_state_sharding = dataclasses.replace(state_sharding, params={})
+    return train_state_sharding, params_sharding
+
+
+def _make_pytree_restore_args(structure: Any, shardings: Any) -> Any:
+    def _make_restore_arg(struct_leaf: Any, sharding_leaf: Any) -> ocp.RestoreArgs:
+        if isinstance(struct_leaf, jax.ShapeDtypeStruct):
+            if sharding_leaf is None:
+                return ocp.RestoreArgs(restore_type=np.ndarray)
+            return ocp.ArrayRestoreArgs(sharding=sharding_leaf, restore_type=jax.Array)
+        if isinstance(struct_leaf, np.ndarray):
+            return ocp.RestoreArgs(restore_type=type(struct_leaf))
+        if hasattr(struct_leaf, "shape") and hasattr(struct_leaf, "dtype"):
+            if sharding_leaf is None:
+                return ocp.RestoreArgs(restore_type=np.ndarray)
+            return ocp.ArrayRestoreArgs(sharding=sharding_leaf, restore_type=jax.Array)
+        return ocp.RestoreArgs()
+
+    return jax.tree.map(_make_restore_arg, structure, shardings)
 
 
 def _split_params(state: training_utils.TrainState) -> tuple[training_utils.TrainState, at.Params]:
