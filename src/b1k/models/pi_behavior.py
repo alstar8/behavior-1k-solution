@@ -907,11 +907,16 @@ class PiBehavior(_model.BaseModel):
             subtask_loss = -jax.nn.log_softmax(subtask_logits)[
                 jnp.arange(ground_truth_subtask.shape[0]), ground_truth_subtask
             ]
-            losses["subtask_loss"] = jnp.mean(subtask_loss)
-            losses["subtask_accuracy"] = jnp.mean(
+            subtask_correct = (
                 jnp.argmax(subtask_logits, axis=-1) == ground_truth_subtask
-            )
-            subtask_loss_value = self.config.subtask_loss_weight * jnp.mean(subtask_loss)
+            ).astype(jnp.float32)
+            # Keep per-example values so the train loop can split metrics by task.
+            # The scalars below stay the batch means used by the training objective.
+            losses["subtask_loss_per_example"] = subtask_loss
+            losses["subtask_correct"] = subtask_correct
+            losses["subtask_loss"] = jnp.mean(subtask_loss)
+            losses["subtask_accuracy"] = jnp.mean(subtask_correct)
+            subtask_loss_value = self.config.subtask_loss_weight * losses["subtask_loss"]
         
         # 13. Total loss
         losses["total_loss"] = losses["action_loss"] + subtask_loss_value + fast_loss_value

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Resume the checkpoint-2 CFGRL rewind run on 3 nodes x 8 GPUs.
+# Resume the checkpoint-2 CFGRL rewind run on 4 nodes x 8 GPUs.
 #
 # Usage:
 #   bash scripts/train_ckpt2_cfgrl_rewind_24gpu.sh          # start all ranks
@@ -115,8 +115,8 @@ launch_all() {
   master_addr="$(hostname -i | awk '{print $1}')"
   master_port="${MASTER_PORT:-12361}"
   world_size="${#HOSTS[@]}"
-  if [[ "${world_size}" -ne 3 ]]; then
-    echo "Expected 3 hosts, found ${world_size}: ${HOSTS[*]}" >&2
+  if [[ "${world_size}" -ne 4 ]]; then
+    echo "Expected 4 hosts, found ${world_size}: ${HOSTS[*]}" >&2
     exit 1
   fi
 
