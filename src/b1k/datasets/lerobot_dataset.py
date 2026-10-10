@@ -902,6 +902,18 @@ class BehaviorLeRobotDataset(LeRobotDataset):
         }
         return query_indices, padding
 
+    def _video_file_offset(self, ep_idx: int, vid_key: str) -> float:
+        """Seconds from the start of a concatenated 2026 mp4 to this episode.
+
+        Parquet timestamps restart at 0 inside each episode. The file position is
+        ``videos/{vid_key}/from_timestamp``. 2025 per-episode videos omit the key.
+        """
+        episode = self.meta.episodes.get(int(ep_idx), {})
+        offset = episode.get(f"videos/{vid_key}/from_timestamp")
+        if offset is None:
+            return 0.0
+        return float(offset)
+
     def _query_videos(self, query_timestamps: dict[str, list[float]], ep_idx: int) -> dict[str, th.Tensor]:
         """Note: When using data workers (e.g. DataLoader with num_workers>0), do not call this function
         in the main process (e.g. by using a second Dataloader with num_workers=0). It will result in a
@@ -910,18 +922,20 @@ class BehaviorLeRobotDataset(LeRobotDataset):
         """
         item = {}
         for vid_key, query_ts in query_timestamps.items():
+            offset = self._video_file_offset(ep_idx, vid_key)
+            file_ts = [float(ts) + offset for ts in query_ts]
             video_path = _resolve_cached_video_path(
                 self.root / self.meta.get_video_file_path(ep_idx, vid_key),
                 self.root,
             )
             try:
-                frames = decode_video_frames(video_path, query_ts, self.tolerance_s, self.video_backend)
+                frames = decode_video_frames(video_path, file_ts, self.tolerance_s, self.video_backend)
             except AssertionError as exc:
                 if not _is_video_tolerance_error(exc):
                     raise
                 frames = _decode_video_frames_with_preroll(
                     video_path,
-                    query_ts,
+                    file_ts,
                     self.tolerance_s,
                     self.fps,
                     self.video_backend,
