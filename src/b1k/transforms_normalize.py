@@ -9,6 +9,19 @@ from openpi.shared import array_typing as at
 from b1k.shared.normalize import NormStats
 
 
+def floor_state_std(norm_stats: dict | None, floor: float) -> dict | None:
+    """Raise every state std to at least `floor`.
+
+    Near-constant joints (last trunk joint, std about 0.0007 rad) otherwise turn
+    sub-milliradian drift into many std, and the 256-bin state tokens jump with it.
+    Training and inference must use the same floor for a checkpoint.
+    """
+    if not norm_stats or floor <= 0 or "state" not in norm_stats:
+        return norm_stats
+    state = norm_stats["state"]
+    return {**norm_stats, "state": dataclasses.replace(state, std=np.maximum(np.asarray(state.std), floor))}
+
+
 @dataclasses.dataclass(frozen=True)
 class NormalizeWithPerTimestamp(DataTransformFn):
     norm_stats: at.PyTree[NormStats] | None

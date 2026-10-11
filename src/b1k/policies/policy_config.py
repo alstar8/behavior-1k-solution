@@ -22,7 +22,7 @@ from b1k.policies.pi_behavior_policy import PiBehaviorPolicy
 from b1k.training import checkpoints as _checkpoints
 from b1k.training import config as _config
 from b1k import transforms as b1k_transforms
-from b1k.transforms_normalize import NormalizeWithPerTimestamp, UnnormalizeWithPerTimestamp
+from b1k.transforms_normalize import NormalizeWithPerTimestamp, UnnormalizeWithPerTimestamp, floor_state_std
 
 
 def create_trained_policy(
@@ -60,6 +60,7 @@ def create_trained_policy(
         if data_config.asset_id is None:
             raise ValueError("Asset id is required to load norm stats.")
         norm_stats = _checkpoints.load_norm_stats(checkpoint_dir / "assets", data_config.asset_id)
+    norm_stats = floor_state_std(norm_stats, float(getattr(data_config, "state_std_floor", 0.0)))
     
     # Load correlation matrix for PiBehavior models
     if isinstance(model, PiBehavior):

@@ -104,6 +104,10 @@ class DataConfig:
     # bin ids and drifts off the demo in closed loop. Set both to 0 to disable.
     proprio_noise_joint_std: float = 0.01
     proprio_noise_base_vel_std: float = 0.02
+    # Lower bound on the state std used for normalization, in the state's own units.
+    # Changes what a trained checkpoint sees, so it stays 0 for existing runs and is
+    # set only on new configs; inference reads the same value from the train config.
+    state_std_floor: float = 0.0
 
 
 class GroupFactory(Protocol):

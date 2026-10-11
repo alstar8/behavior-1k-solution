@@ -23,7 +23,7 @@ import openpi.transforms as _transforms
 from b1k import transforms as b1k_transforms
 from b1k.action_alignment import leads_for_source
 from b1k.models.observation import Observation
-from b1k.transforms_normalize import NormalizeWithPerTimestamp
+from b1k.transforms_normalize import NormalizeWithPerTimestamp, floor_state_std
 
 
 class DataLoaderImpl(DataLoader):
@@ -143,7 +143,7 @@ def transform_dataset(dataset: Dataset, data_config: _config.DataConfig, *, skip
                 "Normalization stats not found. "
                 "Make sure to run `scripts/compute_norm_stats.py --config-name=<your-config>`."
             )
-        norm_stats = data_config.norm_stats
+        norm_stats = floor_state_std(data_config.norm_stats, float(getattr(data_config, "state_std_floor", 0.0)))
 
     # Build transform list
     transforms_list = [

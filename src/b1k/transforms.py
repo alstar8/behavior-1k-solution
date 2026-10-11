@@ -67,6 +67,10 @@ class ProprioNoise(DataTransformFn):
     exact bins. Must run before DeltaActions so the delta label is taken against
     the same perturbed state the model sees. Training-only: never add it to
     data_transforms, which the inference policy reuses.
+
+    The last trunk joint is held fixed in the demos (state std about 0.0007 rad) and
+    is an absolute action channel, so it gets no noise: 0.01 rad there is about 14
+    state std and would push its token to bin 0 or 255, which inference never shows.
     """
 
     joint_std: float = 0.0
@@ -78,15 +82,16 @@ class ProprioNoise(DataTransformFn):
             raise ValueError(f"ProprioNoise expects 61-d compact proprio, got {proprio.shape}")
         rng = np.random.default_rng()
         indices = R1PRO_COMPACT_PROPRIOCEPTION_INDICES
-        for key, std in (
-            ("base_qvel", self.base_vel_std),
-            ("trunk_qpos", self.joint_std),
-            ("arm_left_qpos", self.joint_std),
-            ("arm_right_qpos", self.joint_std),
+        trunk = indices["trunk_qpos"]
+        for part_slice, std in (
+            (indices["base_qvel"], self.base_vel_std),
+            (np.s_[trunk.start : trunk.stop - 1], self.joint_std),
+            (indices["arm_left_qpos"], self.joint_std),
+            (indices["arm_right_qpos"], self.joint_std),
         ):
             if std > 0:
-                part = proprio[..., indices[key]]
-                proprio[..., indices[key]] = part + rng.normal(0.0, std, size=part.shape)
+                part = proprio[..., part_slice]
+                proprio[..., part_slice] = part + rng.normal(0.0, std, size=part.shape)
         data = dict(data)
         data["observation.state"] = proprio
         return data
