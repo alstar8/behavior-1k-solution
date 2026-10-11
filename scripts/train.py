@@ -336,6 +336,11 @@ def train_step(
 
     # Per-example tensors used only to split metrics by task. They are not logged raw.
     task_info = _per_task_sums(observation.tokenized_prompt[:, 0], losses_dict, config.model.num_tasks)
+    dataset_info = _per_dataset_sums(
+        getattr(observation, "dataset_index", None),
+        losses_dict,
+        len(_config.get_data_factories(config)),
+    )
     losses_dict.pop("subtask_loss_per_example", None)
     losses_dict.pop("subtask_correct", None)
 
@@ -346,6 +351,7 @@ def train_step(
         else:
             info[key] = jnp.mean(value)
     info.update(task_info)
+    info.update(dataset_info)
     return new_state, info
 
 
@@ -417,6 +423,91 @@ def _format_task_line(rows: list[dict[str, Any]]) -> str:
         bits.append(f"n={row['count']:.0f}")
         parts.append(" ".join(bits))
     return "Tasks: " + " | ".join(parts)
+
+
+def _per_dataset_sums(dataset_ids, losses_dict: dict[str, Any], num_datasets: int) -> dict[str, Any]:
+    """Sum per-example metrics for each mixed dataset. Logging divides by the count."""
+    if dataset_ids is None or num_datasets <= 1:
+        return {}
+    stats: dict[str, Any] = {}
+    for dataset_id in range(num_datasets):
+        mask = dataset_ids == dataset_id
+        stats[f"dataset_{dataset_id}_count"] = jnp.sum(mask.astype(jnp.float32))
+        for metric_name, source_key in _TASK_METRIC_SOURCES:
+            if source_key not in losses_dict:
+                continue
+            stats[f"dataset_{dataset_id}_{metric_name}_sum"] = jnp.sum(losses_dict[source_key] * mask)
+    return stats
+
+
+def _dataset_log_names(config: _config.TrainConfig) -> tuple[str, ...]:
+    names: list[str] = []
+    for factory in _config.get_data_factories(config):
+        repo = str(getattr(factory, "repo_id", ""))
+        if "2026-challenge-demos" in repo:
+            names.append("2026")
+        elif "b1k_turn_on_radio" in repo or repo.startswith("VERA"):
+            names.append("hf")
+        else:
+            names.append(repo.split("/")[-1] or "dataset")
+    return tuple(names)
+
+
+def _finalize_dataset_metrics(
+    reduced: dict[str, Any], dataset_names: tuple[str, ...]
+) -> list[dict[str, Any]]:
+    """Turn interval-averaged sums and counts into per-dataset means."""
+    rows: list[dict[str, Any]] = []
+    drop: list[str] = []
+    for dataset_id, name in enumerate(dataset_names):
+        count_key = f"dataset_{dataset_id}_count"
+        if count_key not in reduced:
+            continue
+        drop.append(count_key)
+        count = float(reduced[count_key])
+        metrics: dict[str, float] = {}
+        for metric_name, _source_key in _TASK_METRIC_SOURCES:
+            sum_key = f"dataset_{dataset_id}_{metric_name}_sum"
+            if sum_key not in reduced:
+                continue
+            drop.append(sum_key)
+            if count > 0:
+                metrics[metric_name] = float(reduced[sum_key]) / count
+        if count > 0:
+            rows.append({"id": dataset_id, "name": name, "count": count, **metrics})
+    for key in drop:
+        reduced.pop(key, None)
+    return rows
+
+
+def _format_dataset_line(rows: list[dict[str, Any]]) -> str:
+    parts = []
+    for row in rows:
+        bits = [row["name"]]
+        if "action_loss" in row:
+            bits.append(f"action={row['action_loss']:.4f}")
+        if "fast_loss" in row:
+            bits.append(f"fast={row['fast_loss']:.4f}")
+        if "subtask_loss" in row:
+            bits.append(f"subtask={row['subtask_loss']:.4f}")
+        if "fast_accuracy" in row:
+            bits.append(f"fast_acc={row['fast_accuracy']:.3f}")
+        if "subtask_accuracy" in row:
+            bits.append(f"sub_acc={row['subtask_accuracy']:.3f}")
+        bits.append(f"n={row['count']:.0f}")
+        parts.append(" ".join(bits))
+    return "Datasets: " + " | ".join(parts)
+
+
+def _wandb_dataset_metrics(rows: list[dict[str, Any]]) -> dict[str, float]:
+    payload: dict[str, float] = {}
+    for row in rows:
+        prefix = f"dataset/{row['name']}"
+        payload[f"{prefix}/count"] = float(row["count"])
+        for metric_name in ("action_loss", "fast_loss", "fast_accuracy", "subtask_loss", "subtask_accuracy"):
+            if metric_name in row:
+                payload[f"{prefix}/{metric_name}"] = float(row[metric_name])
+    return payload
 
 
 def _wandb_task_metrics(rows: list[dict[str, Any]]) -> dict[str, float]:
@@ -576,6 +667,7 @@ def main(config: _config.TrainConfig):
         ).start()
 
     task_names = tuple(_config._2026_challenge_task_names())
+    dataset_names = _dataset_log_names(config)
     infos = []
     first_step = True
     for step in pbar:
@@ -595,6 +687,7 @@ def main(config: _config.TrainConfig):
             stacked_infos = common_utils.stack_forest(infos)
             reduced_info = jax.device_get(jax.tree.map(jnp.mean, stacked_infos))
             task_rows = _finalize_task_metrics(reduced_info, task_names, config.model.num_tasks)
+            dataset_rows = _finalize_dataset_metrics(reduced_info, dataset_names)
             
             # Create a concise console log with main metrics
             main_metrics = {k: v for k, v in reduced_info.items() 
@@ -609,8 +702,13 @@ def main(config: _config.TrainConfig):
             pbar.write(f"Step {step}: {info_str}")
             if task_rows:
                 pbar.write(_format_task_line(task_rows))
+            if dataset_rows:
+                pbar.write(_format_dataset_line(dataset_rows))
             if jax.process_index() == 0:
-                wandb.log({**reduced_info, **_wandb_task_metrics(task_rows)}, step=step)
+                wandb.log(
+                    {**reduced_info, **_wandb_task_metrics(task_rows), **_wandb_dataset_metrics(dataset_rows)},
+                    step=step,
+                )
             infos = []
         batch = next(data_iter)
 

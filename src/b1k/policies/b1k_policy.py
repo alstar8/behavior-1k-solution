@@ -94,6 +94,8 @@ class B1kInputs(transforms.DataTransformFn):
             inputs["episode_length"] = data["episode_length"]
         if "optimality" in data:
             inputs["optimality"] = np.int32(data["optimality"])
+        if "dataset_index" in data:
+            inputs["dataset_index"] = np.int32(data["dataset_index"])
             
         # Preserve initial_actions for inpainting
         if "initial_actions" in data:

@@ -97,6 +97,8 @@ class DataConfig:
     force_task_index: int | None = None
     # Build CFGRL rewind negatives (o=0) inside the dataset.
     cfgrl_rewind: bool = False
+    # Constant optimality id. 2 is forward. Leaves rewind and dropout off.
+    fixed_optimality: int | None = None
 
 
 class GroupFactory(Protocol):
@@ -185,8 +187,11 @@ class LeRobotB1KDataConfig(DataConfigFactory):
             "episode_index": "episode_index",  # Preserve episode_index for episode length lookup
             "episode_length": "episode_length",
             "index": "index",           # Preserve index
+            "dataset_index": "dataset_index",
         }
-        if self.base_config is not None and self.base_config.cfgrl_rewind:
+        if self.base_config is not None and (
+            self.base_config.cfgrl_rewind or self.base_config.fixed_optimality is not None
+        ):
             repack_mapping["optimality"] = "optimality"
             
         repack_transform = _transforms.Group(
@@ -998,6 +1003,189 @@ _CONFIGS = [
             "pi_behavior_2026_ckpt2_cfgrl_rewind_20260929_031128/66000/params"
         ),
         num_train_steps=100_000,
+        assets_base_dir="./outputs/assets",
+        checkpoint_base_dir="/workspace-SR008.nfs2/datasets/staroverov_b1k/behavior/b1k_solution",
+        num_workers=64,
+        batch_size=1536,
+        fsdp_devices=8,
+        save_interval=2_000,
+        keep_period=2_000,
+        log_interval=25,
+    ),
+    # Forward-only radio mix. 2026 demos are 60% of the batch and the VERA
+    # radio set is 40%. No rewind targets and no optimality dropout.
+    # Weights come from the radio CFGRL run step 24000. That run is not written.
+    TrainConfig(
+        name="pi_behavior_2026_radio_vera40_nocfgrl",
+        exp_name="openpi",
+        project_name="B1K",
+        model=pi_behavior_config.PiBehaviorConfig(
+            action_horizon=30,
+            action_dim=32,
+            use_correlated_noise=True,
+            correlation_beta=0.5,
+            use_fast_auxiliary=True,
+            fast_loss_weight=0.05,
+            fast_encoded_dims="0:6,7:23",
+            fast_vocab_size=1024,
+            max_fast_tokens=200,
+            use_kv_transform=True,
+            use_knowledge_insulation=False,
+            subtask_loss_weight=0.1,
+            freeze_vision_backbone=True,
+            num_tasks=50,
+            legacy_stage_counts=True,
+            use_optimality=True,
+            cfg_guidance_weight=1.5,
+        ),
+        sample_weights=[0.6, 0.4],
+        data=[
+            LeRobotB1KDataConfig(
+                repo_id="behavior-1k/2026-challenge-demos",
+                assets=AssetsConfig(
+                    assets_dir="./outputs/assets/pi_behavior_2026_all100_demo0_6_comet0_4",
+                    asset_id="behavior-1k/2026-challenge-demos",
+                ),
+                base_config=DataConfig(
+                    prompt_from_task=False,
+                    behavior_dataset_root=_behavior_dataset_root("2026-challenge-demos"),
+                    use_per_timestamp_norm=True,
+                    tasks=["turning_on_radio"],
+                    episodes_index=list(range(200)),
+                    tolerance_s=1.0 / 30.0,
+                    cfgrl_rewind=False,
+                    fixed_optimality=2,
+                ),
+                use_delta_joint_actions=True,
+                use_fast_tokenization=True,
+            ),
+            LeRobotB1KDataConfig(
+                repo_id="VERA-VLA/b1k_turn_on_radio",
+                assets=AssetsConfig(
+                    assets_dir="./outputs/assets/pi_behavior_2026_all100_demo0_6_comet0_4",
+                    asset_id="behavior-1k/2026-challenge-demos",
+                ),
+                base_config=DataConfig(
+                    prompt_from_task=False,
+                    behavior_dataset_root=_behavior_dataset_root("b1k_turn_on_radio"),
+                    use_per_timestamp_norm=True,
+                    tasks=["turning_on_radio"],
+                    align_legacy_rft_to_2026=True,
+                    tolerance_s=1.0 / 30.0,
+                    cfgrl_rewind=False,
+                    fixed_optimality=2,
+                ),
+                use_delta_joint_actions=True,
+                use_fast_tokenization=True,
+            ),
+        ],
+        freeze_filter=pi_behavior_config.PiBehaviorConfig(
+            num_tasks=50,
+            legacy_stage_counts=True,
+        ).get_vision_freeze_filter(),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=200,
+            peak_lr=2.5e-5,
+            decay_steps=20_000,
+            decay_lr=2.5e-6,
+        ),
+        num_flow_samples=15,
+        weight_loader=weight_loaders.PiBehaviorWeightLoader(
+            "/workspace-SR008.nfs2/datasets/staroverov_b1k/behavior/b1k_solution/"
+            "pi_behavior_2026_ckpt2_radio_cfgrl_rewind/"
+            "pi_behavior_2026_ckpt2_radio_cfgrl_20261006_172030/24000/params"
+        ),
+        num_train_steps=20_000,
+        assets_base_dir="./outputs/assets",
+        checkpoint_base_dir="/workspace-SR008.nfs2/datasets/staroverov_b1k/behavior/b1k_solution",
+        num_workers=64,
+        batch_size=1536,
+        fsdp_devices=8,
+        save_interval=2_000,
+        keep_period=2_000,
+        log_interval=25,
+    ),
+    # Same 60/40 radio mix as the no-CFGRL run, with rewind targets restored.
+    # Logs 2026 and Hugging Face losses separately. Loads radio step 24000.
+    TrainConfig(
+        name="pi_behavior_2026_radio_vera40_cfgrl",
+        exp_name="openpi",
+        project_name="B1K",
+        model=pi_behavior_config.PiBehaviorConfig(
+            action_horizon=30,
+            action_dim=32,
+            use_correlated_noise=True,
+            correlation_beta=0.5,
+            use_fast_auxiliary=True,
+            fast_loss_weight=0.05,
+            fast_encoded_dims="0:6,7:23",
+            fast_vocab_size=1024,
+            max_fast_tokens=200,
+            use_kv_transform=True,
+            use_knowledge_insulation=False,
+            subtask_loss_weight=0.1,
+            freeze_vision_backbone=True,
+            num_tasks=50,
+            legacy_stage_counts=True,
+            use_optimality=True,
+            cfg_guidance_weight=1.5,
+        ),
+        sample_weights=[0.6, 0.4],
+        data=[
+            LeRobotB1KDataConfig(
+                repo_id="behavior-1k/2026-challenge-demos",
+                assets=AssetsConfig(
+                    assets_dir="./outputs/assets/pi_behavior_2026_all100_demo0_6_comet0_4",
+                    asset_id="behavior-1k/2026-challenge-demos",
+                ),
+                base_config=DataConfig(
+                    prompt_from_task=False,
+                    behavior_dataset_root=_behavior_dataset_root("2026-challenge-demos"),
+                    use_per_timestamp_norm=True,
+                    tasks=["turning_on_radio"],
+                    episodes_index=list(range(200)),
+                    tolerance_s=1.0 / 30.0,
+                    cfgrl_rewind=True,
+                ),
+                use_delta_joint_actions=True,
+                use_fast_tokenization=True,
+            ),
+            LeRobotB1KDataConfig(
+                repo_id="VERA-VLA/b1k_turn_on_radio",
+                assets=AssetsConfig(
+                    assets_dir="./outputs/assets/pi_behavior_2026_all100_demo0_6_comet0_4",
+                    asset_id="behavior-1k/2026-challenge-demos",
+                ),
+                base_config=DataConfig(
+                    prompt_from_task=False,
+                    behavior_dataset_root=_behavior_dataset_root("b1k_turn_on_radio"),
+                    use_per_timestamp_norm=True,
+                    tasks=["turning_on_radio"],
+                    align_legacy_rft_to_2026=True,
+                    tolerance_s=1.0 / 30.0,
+                    cfgrl_rewind=True,
+                ),
+                use_delta_joint_actions=True,
+                use_fast_tokenization=True,
+            ),
+        ],
+        freeze_filter=pi_behavior_config.PiBehaviorConfig(
+            num_tasks=50,
+            legacy_stage_counts=True,
+        ).get_vision_freeze_filter(),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=200,
+            peak_lr=2.5e-5,
+            decay_steps=20_000,
+            decay_lr=2.5e-6,
+        ),
+        num_flow_samples=15,
+        weight_loader=weight_loaders.PiBehaviorWeightLoader(
+            "/workspace-SR008.nfs2/datasets/staroverov_b1k/behavior/b1k_solution/"
+            "pi_behavior_2026_ckpt2_radio_cfgrl_rewind/"
+            "pi_behavior_2026_ckpt2_radio_cfgrl_20261006_172030/24000/params"
+        ),
+        num_train_steps=20_000,
         assets_base_dir="./outputs/assets",
         checkpoint_base_dir="/workspace-SR008.nfs2/datasets/staroverov_b1k/behavior/b1k_solution",
         num_workers=64,

@@ -59,6 +59,8 @@ class Observation(Generic[ArrayT]):
     fast_token_mask: at.Bool[ArrayT, "*b t"] | None = None
     # CFGRL label: 0 = dropped, 1 = rewind, 2 = forward success.
     optimality: at.Int[ArrayT, "*b"] | None = None
+    # Which mixed dataset produced the sample. 0 is the first data config.
+    dataset_index: at.Int[ArrayT, "*b"] | None = None
 
     @classmethod
     def from_dict(cls, data: at.PyTree[ArrayT]) -> "Observation[ArrayT]":
@@ -84,6 +86,7 @@ class Observation(Generic[ArrayT]):
             fast_tokens=data.get("fast_tokens"),
             fast_token_mask=data.get("fast_token_mask"),
             optimality=_as_optimality(data.get("optimality")),
+            dataset_index=_as_dataset_index(data.get("dataset_index")),
         )
 
     def to_dict(self) -> at.PyTree[ArrayT]:
@@ -92,6 +95,16 @@ class Observation(Generic[ArrayT]):
         result["image"] = result.pop("images")
         result["image_mask"] = result.pop("image_masks")
         return result
+
+
+
+def _as_dataset_index(value):
+    """Keep a sharded device array on device. Host arrays are cast to int32."""
+    if value is None:
+        return None
+    if isinstance(value, np.ndarray):
+        return value.astype(np.int32, copy=False)
+    return value
 
 
 def preprocess_observation(
@@ -156,5 +169,6 @@ def preprocess_observation(
         fast_tokens=getattr(observation, 'fast_tokens', None),
         fast_token_mask=getattr(observation, 'fast_token_mask', None),
         optimality=observation.optimality,
+        dataset_index=getattr(observation, "dataset_index", None),
     )
 

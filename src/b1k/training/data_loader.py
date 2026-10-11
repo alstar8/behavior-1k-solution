@@ -93,6 +93,7 @@ def create_behavior_dataset(data_config: _config.DataConfig, action_horizon: int
         check_timestamp_sync=False,
         fine_grained_level=0,
         cfgrl_rewind=bool(getattr(data_config, "cfgrl_rewind", False)),
+        fixed_optimality=getattr(data_config, "fixed_optimality", None),
         action_leads=action_leads,
         action_horizon=action_horizon,
     )

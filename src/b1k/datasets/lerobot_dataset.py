@@ -291,6 +291,7 @@ class BehaviorLeRobotDataset(LeRobotDataset):
         cfgrl_rewind: bool = False,
         cfgrl_rewind_prob: float = 0.5,
         cfgrl_dropout_prob: float = 0.1,
+        fixed_optimality: int | None = None,
         action_leads: dict[str, int] | None = None,
         action_horizon: int = 30,
     ):
@@ -340,6 +341,7 @@ class BehaviorLeRobotDataset(LeRobotDataset):
         self.cfgrl_rewind = cfgrl_rewind
         self.cfgrl_rewind_prob = cfgrl_rewind_prob
         self.cfgrl_dropout_prob = cfgrl_dropout_prob
+        self.fixed_optimality = fixed_optimality
         # Per-slice lead of the action label relative to the observation row.
         # None keeps the action stored on that same row.
         if action_leads is None:
@@ -635,6 +637,11 @@ class BehaviorLeRobotDataset(LeRobotDataset):
                         continue
                     if self.cfgrl_rewind:
                         item = self._apply_cfgrl_rewind(item, candidate_idx)
+                    elif self.fixed_optimality is not None:
+                        item = dict(item)
+                        item["optimality"] = np.int32(self.fixed_optimality)
+                    item = dict(item)
+                    item["dataset_index"] = np.int32(getattr(self, "dataset_index", 0))
                     return item
                 except AssertionError as exc:
                     if not _is_video_tolerance_error(exc):
@@ -772,7 +779,10 @@ class BehaviorLeRobotDataset(LeRobotDataset):
         if item is None:
             return self.__getitem__(idx)
 
-        return self._alias_v3_rgb_keys(item)
+        item = self._alias_v3_rgb_keys(item)
+        item = dict(item)
+        item["dataset_index"] = np.int32(getattr(self, "dataset_index", 0))
+        return item
 
     def _episode_bounds(self, episode_index: int) -> tuple[int, int]:
         ep_pos = int(self.episode_data_index_pos[int(episode_index)])
@@ -1286,4 +1296,7 @@ class MultiBehaviorLeRobotDataset:
     def __getitem__(self, idx):
         index = np.random.choice(range(len(self.datasets)), p=self.sample_weights)
         dataset = self.datasets[index]
-        return dataset[int(idx) % len(dataset)]
+        item = dataset[int(idx) % len(dataset)]
+        item = dict(item)
+        item["dataset_index"] = np.int32(index)
+        return item
