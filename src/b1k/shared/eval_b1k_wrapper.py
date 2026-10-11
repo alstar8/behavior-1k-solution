@@ -9,7 +9,7 @@ from collections import deque
 from openpi_client.base_policy import BasePolicy
 from openpi_client.image_tools import resize_with_pad
 from b1k.policies.b1k_policy import extract_state_from_proprio
-from b1k.models.pi_behavior_config import TASK_NUM_STAGES
+from b1k.models.pi_behavior_config import TASK_NUM_STAGES, TASK_NUM_STAGES_2025
 from b1k.shared.correction_rules import apply_correction_rules, check_gripper_variation
 from b1k.shared.convert_2025_action import convert_2025_action_to_2026
 logger = logging.getLogger(__name__)
@@ -30,7 +30,9 @@ class B1KWrapperConfig:
     """Configuration for B1K policy wrapper execution parameters."""
     actions_to_execute: int = 26
     actions_to_keep: int = 4
-    execute_in_n_steps: int = 20
+    # Below actions_to_execute the chunk is time-compressed and base velocity is scaled up,
+    # which training never sees. Keep equal to actions_to_execute unless ablating.
+    execute_in_n_steps: int = 26
     history_len: int = 3
     votes_to_promote: int = 2
     time_threshold_inpaint: float = 0.3
@@ -78,6 +80,11 @@ class B1KPolicyWrapper():
         self.step_count = 0
         self.prediction_count = 0
         self.next_initial_actions = None
+
+    def _stage_count(self, task_id: int) -> int:
+        """Stage table that matches the loaded checkpoint."""
+        table = TASK_NUM_STAGES_2025 if self.config.convert_2025_actions else TASK_NUM_STAGES
+        return table[task_id]
     
     def reset(self):
         """Reset policy state."""
@@ -97,7 +104,7 @@ class B1KPolicyWrapper():
             old_task_id = self.task_id
             self.task_id = new_task_id
             
-            logger.info(f"🔄 Task change detected: {old_task_id} → {new_task_id} (max stages: {TASK_NUM_STAGES[new_task_id]})")
+            logger.info(f"🔄 Task change detected: {old_task_id} → {new_task_id} (max stages: {self._stage_count(new_task_id)})")
             
             if self.checkpoint_switcher:
                 new_policy = self.checkpoint_switcher.get_policy_for_task(new_task_id)
@@ -143,7 +150,7 @@ class B1KPolicyWrapper():
     def _gt_stage(self) -> int:
         """Time-split stage used as the training label, indexed by control step."""
         task_id = self.task_id if self.task_id is not None else 0
-        num_stages = TASK_NUM_STAGES[task_id]
+        num_stages = self._stage_count(task_id)
         frames_per_stage = self.config.gt_episode_length / num_stages
         if frames_per_stage <= 0:
             return 0
@@ -155,7 +162,7 @@ class B1KPolicyWrapper():
         if self.task_id is None:
             return
             
-        max_stage = TASK_NUM_STAGES[self.task_id] - 1
+        max_stage = self._stage_count(self.task_id) - 1
         predicted_stage = int(np.argmax(predicted_subtask_logits))
         
         if predicted_stage > max_stage:
@@ -331,7 +338,7 @@ class B1KPolicyWrapper():
         
         # Log progress every 100 steps
         if self.step_count % 100 == 0:
-            logger.info(f"📊 Step {self.step_count} | Task: {self.task_id} | Stage: {self.current_stage}/{TASK_NUM_STAGES[self.task_id]-1} | Predictions: {self.prediction_count}")
+            logger.info(f"📊 Step {self.step_count} | Task: {self.task_id} | Stage: {self.current_stage}/{self._stage_count(self.task_id)-1} | Predictions: {self.prediction_count}")
         
         # Convert to torch tensor
         action_tensor = torch.from_numpy(current_action).float()

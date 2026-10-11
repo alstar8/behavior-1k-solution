@@ -101,6 +101,10 @@ def create_behavior_dataset(data_config: _config.DataConfig, action_horizon: int
     pre_transforms = []
     if getattr(data_config, "align_legacy_rft_to_2026", False):
         pre_transforms.append(b1k_transforms.AlignLegacyRftTo2026())
+    joint_std = float(getattr(data_config, "proprio_noise_joint_std", 0.0))
+    base_vel_std = float(getattr(data_config, "proprio_noise_base_vel_std", 0.0))
+    if joint_std > 0 or base_vel_std > 0:
+        pre_transforms.append(b1k_transforms.ProprioNoise(joint_std=joint_std, base_vel_std=base_vel_std))
     pre_transforms.append(
         b1k_transforms.AttachEpisodeMetadata(
             episode_lengths=_episode_lengths_from_meta(dataset),

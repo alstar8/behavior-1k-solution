@@ -30,9 +30,9 @@ We use policy based on Pi0.5 and built on top of [openpi](https://github.com/Phy
 
 **Inference Optimizations:**
 - Soft inpainting: predict 30 actions, execute 26, keep 4 for next prediction for inpainting. Inpainting is soft (only first 70% of the denoising steps are inpainted) and correlation aware (the rest of the actions are guided towards the linear regression prediction for them from the original 4 actions).
-- 1.3x speedup via cubic interpolation (26 predicted actions are executed in 20 steps). Speed up is disabled when gripper state is changing
+- Optional 1.3x speedup via cubic interpolation (`--execute-in-n-steps 20` executes 26 predicted actions in 20 steps). The 2025 submission used it; the default is now 26, so playback speed matches training. Speed up is disabled when gripper state is changing
 - General correction rule: open gripper after failed grasp attempts.
-- Extra hardcoded correction rule for radio tasks (probably not important but is kept as a legacy).
+- The 2025 hardcoded radio rule (stage 4 always reset to stage 2) is removed. It kept radio from ever holding its final stage.
 - We use 4 checkpoints of the same model for different tasks. They were initially trained on 50 tasks simultaneously but later split and finetuned on the separate subsets of tasks.
 
 

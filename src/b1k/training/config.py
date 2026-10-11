@@ -99,6 +99,11 @@ class DataConfig:
     cfgrl_rewind: bool = False
     # Constant optimality id. 2 is forward. Leaves rewind and dropout off.
     fixed_optimality: int | None = None
+    # Training-only Gaussian noise on proprio joints (rad) and base velocity (m/s, rad/s).
+    # The state is discretized into 256 tokens, so without noise the policy keys on exact
+    # bin ids and drifts off the demo in closed loop. Set both to 0 to disable.
+    proprio_noise_joint_std: float = 0.01
+    proprio_noise_base_vel_std: float = 0.02
 
 
 class GroupFactory(Protocol):

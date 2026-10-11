@@ -38,7 +38,7 @@ python scripts/serve_b1k.py \
   --task-id 0 \
   --actions-to-execute 26 \
   --actions-to-keep 4 \
-  --execute-in-n-steps 20 \
+  --execute-in-n-steps 26 \
   --num-steps 20 \
   --apply-eval-tricks \
   policy:checkpoint \
@@ -46,7 +46,7 @@ python scripts/serve_b1k.py \
   --policy.dir /workspace-SR008.nfs2/datasets/staroverov_b1k/behavior/b1k_solution/pi_behavior_2026_radio_demo0_6_comet0_4/pi_behavior_2026_radio_from100k_20260921_213403_step95000
 ```
 
-`--task-id 0` selects the radio embedding. The wrapper keeps the last 4 of every 30 predicted actions for correlation-aware inpainting, executes 26 predictions over 20 control steps (1.3x), and holds the stage until two of the last three predictions agree. `--apply-eval-tricks` is the competition correction rule (open the gripper after a failed grasp, plus the legacy radio rule). Turn it off only for an ablation.
+`--task-id 0` selects the radio embedding. The wrapper keeps the last 4 of every 30 predicted actions for correlation-aware inpainting, executes 26 predictions over 26 control steps, and holds the stage until two of the last three predictions agree. The 2025 competition setting `--execute-in-n-steps 20` played 26 actions in 20 steps (1.3x, base velocity scaled up), which the policy never sees in training. `--apply-eval-tricks` opens the gripper after a failed grasp. Turn it off only for an ablation.
 
 In a second process, with the OmniGibson environment that matches `B1K_AIRI/BEHAVIOR-1K`, run the public test split. Instance index 0 is the first public-test instance (simulator id 301), not demo episode 0.
 

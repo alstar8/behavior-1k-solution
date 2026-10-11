@@ -72,7 +72,7 @@ class Args:
     # B1K Wrapper execution parameters
     actions_to_execute: int = 26
     actions_to_keep: int = 4
-    execute_in_n_steps: int = 20
+    execute_in_n_steps: int = 26  # Below actions_to_execute: time-compressed playback, unseen in training
     history_len: int = 3
     votes_to_promote: int = 2
     time_threshold_inpaint: float = 0.3

@@ -76,78 +76,6 @@ RIGHT_GRIPPER_ALWAYS_ALLOWED = {38, 39}  # spraying_for_bugs, spraying_fruit_tre
 # CORRECTION RULES - ADD NEW RULES HERE
 # ============================================================================
 
-def task0_stage4_reset_to_stage2(
-    task_id: int,
-    stage: int,
-    state: np.ndarray,
-    actions: np.ndarray
-) -> Optional[Tuple[np.ndarray, int]]:
-    # Probably not very important for the final solution
-    """
-    Task 0 (Radio), Stage 4: Reset to stage 2 with arm/gripper recovery.
-    
-    PRIMARY: task_id=0 AND stage=4 → reset to stage 2 (always)
-    
-    SECONDARY (conditional):
-    - If both grippers are fully open or fully closed:
-      → Open closed grippers
-    
-    Args:
-        task_id: Current task ID
-        stage: Current stage
-        state: Current state (23-dim)
-        actions: Predicted actions (horizon, 23)
-    
-    Returns:
-        (corrected_actions, corrected_stage) if rule applies, None otherwise
-    """
-    # Check primary condition
-    if task_id != 0 or stage < 2:
-        return None
-    
-    # PRIMARY: Always reset stage
-    if stage == 4:
-        logger.info(f"🔧 CORRECTION RULE: Task 0 (Radio), Stage 4 → Stage 2")
-        corrected_stage = 2
-    else:
-        corrected_stage = stage
-
-    # SECONDARY: Check gripper states
-    left_gripper = state[LEFT_GRIPPER_IDX]
-    right_gripper = state[RIGHT_GRIPPER_IDX]
-    
-    left_closed = left_gripper < CLOSED_THRESHOLD
-    right_closed = right_gripper < CLOSED_THRESHOLD
-    left_open = left_gripper > OPEN_THRESHOLD
-    right_open = right_gripper > OPEN_THRESHOLD
-    
-    # Check if any gripper is in middle position (not fully open or closed)
-    left_middle = not (left_open or left_closed)
-    right_middle = not (right_open or right_closed)
-    
-    change_action = False
-
-    # Copy current state to all actions as baseline
-    corrected_actions = np.tile(state, (actions.shape[0], 1))
-
-    if left_closed and not right_middle:
-        corrected_actions[:, LEFT_GRIPPER_IDX] = 1.0
-        change_action = True
-        logger.info(f"   - Opening left gripper → 1.0")
-    if right_closed and not left_middle:
-        corrected_actions[:, RIGHT_GRIPPER_IDX] = 1.0
-        change_action = True
-        logger.info(f"   - Opening right gripper → 1.0")
-
-    if not change_action:
-        if stage == corrected_stage:
-            return None
-
-        corrected_actions = actions
-    
-    return corrected_actions, corrected_stage
-
-
 def general_gripper_correction(
     task_id: int,
     stage: int,
@@ -161,9 +89,6 @@ def general_gripper_correction(
     1. Always-open tasks: Open gripper if closed (any stage)
     2. Stage-restricted tasks: Open gripper if closed before allowed stage
     3. Exceptions: Skip tasks where gripper is intentionally closed (e.g., spray bottles)
-    
-    Works in conjunction with task-specific rules:
-    - Task 0: This rule handles stages ≤1, task-specific rule handles stage 4
     
     Args:
         task_id: Current task ID
@@ -238,8 +163,8 @@ def general_gripper_correction(
 # Task-specific rules (these run BEFORE the general rule)
 # Dictionary mapping task_id -> list of rule functions
 TASK_SPECIFIC_RULES = {
-    0: [task0_stage4_reset_to_stage2],  # Radio has special stage 4 handling
-    # Add more task-specific rules here as needed
+    # Radio (task 0) used to reset stage 4 to stage 2 on every chunk, so the
+    # final stage could never be held. Do not reintroduce unconditional stage resets.
 }
 
 # General rules that apply to ALL tasks (run after task-specific rules)
@@ -262,7 +187,7 @@ def apply_correction_rules(
     Apply correction rules for the given task_id.
     
     Rules are applied in order until one matches:
-    1. Task-specific rules (e.g., radio's special stage 4 handling)
+    1. Task-specific rules (none registered at the moment)
     2. General rules (e.g., gripper correction policies)
     
     Only the first matching rule is applied per call.

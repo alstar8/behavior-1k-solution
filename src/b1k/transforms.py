@@ -36,6 +36,8 @@ from openpi.transforms import (
 
 from b1k.models.pi_behavior_config import TASK_NUM_STAGES
 from b1k.shared.normalize import NormStats
+from b1k.shared.b1k_proprio import R1PRO_COMPACT_PROPRIOCEPTION_INDICES
+from b1k.shared.b1k_proprio import R1PRO_COMPACT_PROPRIO_DIM
 from b1k.shared.b1k_proprio import legacy_proprio_to_compact
 
 
@@ -52,6 +54,41 @@ class AlignLegacyRftTo2026(DataTransformFn):
         for key in ("observation.state", "observation/state"):
             if key in data:
                 data[key] = legacy_proprio_to_compact(np.asarray(data[key]))
+        return data
+
+
+@dataclasses.dataclass(frozen=True)
+class ProprioNoise(DataTransformFn):
+    """Gaussian noise on the 61-d compact proprio of a training sample.
+
+    The policy reads the state as 256 bins per normalized dimension, about 0.003 rad
+    for an arm joint and 0.001 m/s for base velocity, and neighbouring bins are
+    unrelated tokens. Clean demo proprio lets it memorize each episode by those
+    exact bins. Must run before DeltaActions so the delta label is taken against
+    the same perturbed state the model sees. Training-only: never add it to
+    data_transforms, which the inference policy reuses.
+    """
+
+    joint_std: float = 0.0
+    base_vel_std: float = 0.0
+
+    def __call__(self, data: DataDict) -> DataDict:
+        proprio = np.array(data["observation.state"], dtype=np.float32, copy=True)
+        if proprio.shape[-1] != R1PRO_COMPACT_PROPRIO_DIM:
+            raise ValueError(f"ProprioNoise expects 61-d compact proprio, got {proprio.shape}")
+        rng = np.random.default_rng()
+        indices = R1PRO_COMPACT_PROPRIOCEPTION_INDICES
+        for key, std in (
+            ("base_qvel", self.base_vel_std),
+            ("trunk_qpos", self.joint_std),
+            ("arm_left_qpos", self.joint_std),
+            ("arm_right_qpos", self.joint_std),
+        ):
+            if std > 0:
+                part = proprio[..., indices[key]]
+                proprio[..., indices[key]] = part + rng.normal(0.0, std, size=part.shape)
+        data = dict(data)
+        data["observation.state"] = proprio
         return data
 
 
