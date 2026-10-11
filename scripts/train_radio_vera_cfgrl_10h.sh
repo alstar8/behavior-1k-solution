@@ -12,7 +12,7 @@ ROOT="/workspace-SR008.nfs2/users/staroverov/B1K/behavior-1k-solution"
 B1K_ROOT="/workspace-SR008.nfs2/users/staroverov/B1K"
 COMET_ENV="/workspace-SR008.nfs2/users/staroverov/B1K/B1K_AIRI/openpi_comet/.venv"
 OG_ROOT="/workspace-SR008.nfs2/users/staroverov/B1K/B1K_AIRI/BEHAVIOR-1K"
-CONFIG_NAME="pi_behavior_2026_radio_vera40_cfgrl"
+CONFIG_NAME="${OPENPI_CONFIG_NAME:-pi_behavior_2026_radio_vera40_cfgrl}"
 EXP_NAME="${OPENPI_EXP_NAME:-pi_behavior_2026_radio_vera40_cfgrl_$(date +%Y%m%d_%H%M%S)}"
 CKPT_ROOT="/workspace-SR008.nfs2/datasets/staroverov_b1k/behavior/b1k_solution"
 LOG_DIR="${CKPT_ROOT}/logs"
@@ -156,7 +156,7 @@ launch_all() {
     pidfile="${LOG_DIR}/train_${EXP_NAME}_16gpu_rank${rank}.pid"
     echo "starting rank ${rank} on ${host} -> ${log}"
     ssh ${SSH_OPTS} -f "${host}" \
-      "cd '${B1K_ROOT}' && setsid env WORLD_RANK=${rank} WORLD_SIZE=2 MASTER_ADDR=${master_addr} MASTER_PORT=${master_port} EXP_NAME='${EXP_NAME}' OPENPI_EXP_NAME='${EXP_NAME}' CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 OPENPI_BATCH_SIZE=1536 OPENPI_FSDP_DEVICES=8 OPENPI_NUM_WORKERS=64 OPENPI_DATALOADER_IN_ORDER=1 OPENPI_DATALOADER_PREFETCH_FACTOR=4 OPENPI_BATCH_PREFETCH=4 XLA_PYTHON_CLIENT_MEM_FRACTION=0.85 NCCL_NVLS_ENABLE=0 XLA_GPU_AUTOTUNE_LEVEL=1 JAX_COMPILATION_CACHE_DIR=/workspace-SR008.nfs2/users/staroverov/.cache/jax TRAIN_WALL_CLOCK='${TRAIN_WALL_CLOCK}' bash '${ROOT}/scripts/train_radio_vera_cfgrl_10h.sh' rank > '${log}' 2>&1 < /dev/null & echo \$! > '${pidfile}'; exit 0" \
+      "cd '${B1K_ROOT}' && setsid env WORLD_RANK=${rank} WORLD_SIZE=2 MASTER_ADDR=${master_addr} MASTER_PORT=${master_port} EXP_NAME='${EXP_NAME}' OPENPI_EXP_NAME='${EXP_NAME}' OPENPI_CONFIG_NAME='${CONFIG_NAME}' CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 OPENPI_BATCH_SIZE=1536 OPENPI_FSDP_DEVICES=8 OPENPI_NUM_WORKERS=64 OPENPI_DATALOADER_IN_ORDER=1 OPENPI_DATALOADER_PREFETCH_FACTOR=4 OPENPI_BATCH_PREFETCH=4 XLA_PYTHON_CLIENT_MEM_FRACTION=0.85 NCCL_NVLS_ENABLE=0 XLA_GPU_AUTOTUNE_LEVEL=1 JAX_COMPILATION_CACHE_DIR=/workspace-SR008.nfs2/users/staroverov/.cache/jax TRAIN_WALL_CLOCK='${TRAIN_WALL_CLOCK}' bash '${ROOT}/scripts/train_radio_vera_cfgrl_10h.sh' rank > '${log}' 2>&1 < /dev/null & echo \$! > '${pidfile}'; exit 0" \
       </dev/null
   done
   sleep 2

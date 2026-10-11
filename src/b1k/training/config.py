@@ -1279,6 +1279,25 @@ _CONFIGS = [
     ),
 ]
 
+
+def _with_state_std_floor(config: TrainConfig, name: str, floor: float) -> TrainConfig:
+    data = [
+        dataclasses.replace(factory, base_config=dataclasses.replace(factory.base_config, state_std_floor=floor))
+        for factory in config.data
+    ]
+    return dataclasses.replace(config, name=name, data=data)
+
+
+# The 60/40 radio CFGRL recipe with a state std floor. 0.05 is below every other state
+# std (smallest is base y velocity, 0.06), so only the fixed last trunk joint changes.
+_CONFIGS.append(
+    _with_state_std_floor(
+        next(config for config in _CONFIGS if config.name == "pi_behavior_2026_radio_vera40_cfgrl"),
+        "pi_behavior_2026_radio_vera40_cfgrl_floor",
+        0.05,
+    )
+)
+
 if len({config.name for config in _CONFIGS}) != len(_CONFIGS):
     raise ValueError("Config names must be unique.")
 _CONFIGS_DICT = {config.name: config for config in _CONFIGS}
