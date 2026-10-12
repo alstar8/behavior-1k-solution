@@ -111,6 +111,11 @@ run_rank() {
     *"xla_gpu_autotune_level"*) ;;
     *) export XLA_FLAGS="${XLA_FLAGS:-} --xla_gpu_autotune_level=${autotune_level}" ;;
   esac
+  # Level 0 writes untuned default GEMM configs into the shared per-fusion autotune
+  # cache, and later level-1 compiles reuse them instead of tuning.
+  if [[ "${autotune_level}" == "0" ]]; then
+    export JAX_PERSISTENT_CACHE_ENABLE_XLA_CACHES="${JAX_PERSISTENT_CACHE_ENABLE_XLA_CACHES:-none}"
+  fi
   case " ${XLA_FLAGS:-} " in
     *"xla_gpu_shard_autotuning"*) ;;
     *) export XLA_FLAGS="${XLA_FLAGS} --xla_gpu_shard_autotuning=false" ;;
