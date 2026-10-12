@@ -53,6 +53,9 @@ run_rank() {
   export WANDB_DIR="${CKPT_ROOT}/wandb"
   export XLA_PYTHON_CLIENT_MEM_FRACTION="${XLA_PYTHON_CLIENT_MEM_FRACTION:-0.85}"
   export XLA_PYTHON_CLIENT_PREALLOCATE="${XLA_PYTHON_CLIENT_PREALLOCATE:-true}"
+  # train.py defaults to the platform allocator, which frees ~40 GB of step buffers back
+  # to the driver and mallocs them again every step. BFC keeps them in one pool.
+  export XLA_PYTHON_CLIENT_ALLOCATOR="${XLA_PYTHON_CLIENT_ALLOCATOR:-bfc}"
   # Active InfiniBand ports only; the 100G Ethernet ports are left out. Names differ
   # between nodes, so the list is built per host. "=" makes the match exact, so
   # mlx5_1 is not taken as a prefix of mlx5_10 / mlx5_11.
@@ -118,7 +121,7 @@ run_rank() {
   echo "exp=${EXP_NAME} batch=${OPENPI_BATCH_SIZE:-3072} fsdp=${OPENPI_FSDP_DEVICES:-8} wall=${TRAIN_WALL_CLOCK}"
   echo "init=${INIT_PARAMS}"
   echo "output=${CKPT_DIR}"
-  echo "NCCL_IB_HCA=${NCCL_IB_HCA:-} XLA_FLAGS=${XLA_FLAGS}"
+  echo "NCCL_IB_HCA=${NCCL_IB_HCA:-} XLA_FLAGS=${XLA_FLAGS} allocator=${XLA_PYTHON_CLIENT_ALLOCATOR}"
   python -c "import b1k, openpi; print('b1k', b1k.__file__); print('openpi', openpi.__file__)"
 
   # Empty directory plus --resume avoids the two-host FileExistsError race.
