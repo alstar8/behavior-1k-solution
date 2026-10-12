@@ -1277,6 +1277,82 @@ _CONFIGS = [
         keep_period=50_000,
         log_interval=25,
     ),
+    # Checkpoint 2 finetune on picking_up_toys (2026 task index 7, one of the
+    # 16 tasks those weights already cover). Forward labels only: no rewind
+    # targets and no optimality dropout. Comet RFT has no picking_up_toys
+    # trajectories, so the batch is the 200 challenge demos. Proprio noise is
+    # on, and the state std floor keeps the fixed trunk joint from saturating.
+    TrainConfig(
+        name="pi_behavior_2026_ckpt2_toys_nocfgrl",
+        exp_name="openpi",
+        project_name="B1K",
+        model=pi_behavior_config.PiBehaviorConfig(
+            action_horizon=30,
+            action_dim=32,
+            use_correlated_noise=True,
+            correlation_beta=0.5,
+            use_fast_auxiliary=True,
+            fast_loss_weight=0.05,
+            fast_encoded_dims="0:6,7:23",
+            fast_vocab_size=1024,
+            max_fast_tokens=200,
+            use_kv_transform=True,
+            use_knowledge_insulation=False,
+            subtask_loss_weight=0.1,
+            freeze_vision_backbone=True,
+            num_tasks=50,
+            legacy_stage_counts=True,
+            use_optimality=True,
+            cfg_guidance_weight=1.5,
+        ),
+        data=LeRobotB1KDataConfig(
+            repo_id="behavior-1k/2026-challenge-demos",
+            assets=AssetsConfig(
+                assets_dir="./outputs/assets/pi_behavior_2026_all100_demo0_6_comet0_4",
+                asset_id="behavior-1k/2026-challenge-demos",
+            ),
+            base_config=DataConfig(
+                prompt_from_task=False,
+                behavior_dataset_root=_behavior_dataset_root("2026-challenge-demos"),
+                use_per_timestamp_norm=True,
+                tasks=["picking_up_toys"],
+                episodes_index=list(range(200)),
+                force_task_index=7,
+                tolerance_s=1.0 / 30.0,
+                cfgrl_rewind=False,
+                fixed_optimality=2,
+                proprio_noise_joint_std=0.01,
+                proprio_noise_base_vel_std=0.02,
+                state_std_floor=0.05,
+            ),
+            use_delta_joint_actions=True,
+            use_fast_tokenization=True,
+        ),
+        freeze_filter=pi_behavior_config.PiBehaviorConfig(
+            num_tasks=50,
+            legacy_stage_counts=True,
+        ).get_vision_freeze_filter(),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=200,
+            peak_lr=2.5e-5,
+            decay_steps=30_000,
+            decay_lr=2.5e-6,
+        ),
+        num_flow_samples=15,
+        weight_loader=weight_loaders.PiBehaviorWeightLoader(
+            "/workspace-SR008.nfs2/datasets/staroverov_b1k/behavior/pretrained/"
+            "behavior_submission/checkpoint_2/params"
+        ),
+        num_train_steps=100_000,
+        assets_base_dir="./outputs/assets",
+        checkpoint_base_dir="/workspace-SR008.nfs2/datasets/staroverov_b1k/behavior/b1k_solution",
+        num_workers=64,
+        batch_size=3072,
+        fsdp_devices=8,
+        save_interval=2_000,
+        keep_period=2_000,
+        log_interval=25,
+    ),
 ]
 
 
