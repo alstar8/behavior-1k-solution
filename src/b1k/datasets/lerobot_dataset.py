@@ -430,6 +430,7 @@ class BehaviorLeRobotDataset(LeRobotDataset):
             self.hf_dataset = self.load_hf_dataset()
 
         self.episode_data_index = get_episode_data_index(self.meta.episodes, self.episodes)
+        self._check_episode_rows()
 
         # Check timestamps
         if check_timestamp_sync:
@@ -610,6 +611,12 @@ class BehaviorLeRobotDataset(LeRobotDataset):
         if b1k_dataset_layout(self.root) == "lerobot_parquet":
             files = sorted({str(self.root / self.meta.get_data_file_path(ep_idx)) for ep_idx in self.episodes})
             hf_dataset = load_dataset("parquet", data_files=files, split="train")
+            # Each 2026 file holds many episodes. Rows of unselected episodes would shift
+            # every episode_data_index offset, which counts selected episodes only.
+            episode_col = np.asarray(hf_dataset.with_format("numpy")["episode_index"])
+            keep = np.flatnonzero(np.isin(episode_col, np.asarray(self.episodes)))
+            if keep.size != episode_col.size:
+                hf_dataset = hf_dataset.select(keep)
             hf_dataset.set_transform(hf_transform_to_torch)
             return hf_dataset
 
@@ -783,6 +790,23 @@ class BehaviorLeRobotDataset(LeRobotDataset):
         item = dict(item)
         item["dataset_index"] = np.int32(getattr(self, "dataset_index", 0))
         return item
+
+    def _check_episode_rows(self) -> None:
+        """Fail if the first or last row of an episode's index range is another episode."""
+        starts = self.episode_data_index["from"]
+        ends = self.episode_data_index["to"]
+        if int(ends[-1]) != len(self.hf_dataset):
+            raise RuntimeError(f"episode_data_index ends at {int(ends[-1])}, hf_dataset has {len(self.hf_dataset)} rows")
+        rows = th.cat([starts, ends - 1]).tolist()
+        found = np.asarray([int(ep) for ep in self.hf_dataset[rows]["episode_index"]])
+        expected = np.tile(np.asarray(self.episodes), 2)
+        bad = np.flatnonzero(found != expected)
+        if bad.size:
+            i = int(bad[0])
+            raise RuntimeError(
+                f"{bad.size} episode boundary rows hold the wrong episode, e.g. row {rows[i]}: "
+                f"expected {expected[i]}, found {found[i]}"
+            )
 
     def _episode_bounds(self, episode_index: int) -> tuple[int, int]:
         ep_pos = int(self.episode_data_index_pos[int(episode_index)])
